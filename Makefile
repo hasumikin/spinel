@@ -4251,6 +4251,14 @@ infer-test: $(SPINEL) $(SP_RT_LIB)
 	grep -q '"line":16,"col":4,.*"kind":"CallNode","name":"widen","dispatch":"direct"' "$$tmp/et.json" || { echo "infer-test: FAIL (--emit-types: a direct call is reported as one)"; ok=0; }; \
 	grep -q '"line":6,"col":12,"end_line":6,"end_col":13,"kind":"RequiredParameterNode","name":"o","type":"poly","rbs":"untyped"' "$$tmp/et.json" || { echo "infer-test: FAIL (--emit-types: a parameter has a record carrying the slot type)"; ok=0; }; \
 	grep -q '"line":4,"col":17,.*"kind":"RequiredParameterNode","name":"x","type":"int","rbs":"Integer"' "$$tmp/et.json" || { echo "infer-test: FAIL (--emit-types: a typed parameter record)"; ok=0; }; \
+	$(SPINEL) test/infer/emit_types_nullable.rb --emit-types -o "$$tmp/etn.json" >/dev/null 2>&1 || { echo "infer-test: FAIL (--emit-types on emit_types_nullable)"; exit 1; }; \
+	grep -q '"line":16,"col":2,"end_line":16,"end_col":13,"kind":"CallNode","name":"\[\]","type":"string","rbs":"String","nullable":true' "$$tmp/etn.json" || { echo "infer-test: FAIL (--emit-types: a String a pick can miss is nullable)"; ok=0; }; \
+	grep -q '"line":19,"col":3,.*"kind":"StringNode","type":"string","rbs":"String","nullable":false' "$$tmp/etn.json" || { echo "infer-test: FAIL (--emit-types: a String literal is not nullable)"; ok=0; }; \
+	grep -q '"line":13,"col":2,.*"kind":"LocalVariableReadNode","name":"s","type":"int","rbs":"Integer","nullable":false' "$$tmp/etn.json" || { echo "infer-test: FAIL (--emit-types: an Integer local no nil reaches is not nullable)"; ok=0; }; \
+	grep -q '"line":15,"col":0,.*"kind":"DefNode","name":"first_name",.*"return_nullable":true' "$$tmp/etn.json" || { echo "infer-test: FAIL (--emit-types: a method whose value a pick can miss has return_nullable)"; ok=0; }; \
+	grep -q '"line":10,"col":0,.*"kind":"DefNode","name":"total",.*"return_nullable":false' "$$tmp/etn.json" || { echo "infer-test: FAIL (--emit-types: an Integer-returning method no nil reaches has return_nullable false)"; ok=0; }; \
+	grep -q '"line":6,"col":0,.*"kind":"DefNode","name":"find",.*"rbs":"Symbol","owner":"Object","signature":"[^"]*","widened":true}' "$$tmp/etn.json" || { echo "infer-test: FAIL (--emit-types: an untyped return carries no return_nullable)"; ok=0; }; \
+	grep -q '"line":6,"col":12,.*"kind":"RequiredParameterNode","name":"k","type":"int","rbs":"Integer","nullable":false' "$$tmp/etn.json" || { echo "infer-test: FAIL (--emit-types: a parameter record answers for its slot)"; ok=0; }; \
 	$(SPINEL) test/poly_attr_writer_distinct_family_override.rb --emit-types -o "$$tmp/paf.json" >/dev/null 2>&1 || { echo "infer-test: FAIL (--emit-types on distinct poly attr-writer families)"; ok=0; }; \
 	grep -q '"line":17,"col":4,.*"kind":"InstanceVariableReadNode","name":"@params","type":"str_str_hash"' "$$tmp/paf.json" && \
 	grep -q '"line":35,"col":4,.*"kind":"InstanceVariableReadNode","name":"@params","type":"str_str_hash"' "$$tmp/paf.json" || { echo "infer-test: FAIL (an unknown writer merged distinct @params families)"; ok=0; }; \
@@ -4258,7 +4266,7 @@ infer-test: $(SPINEL) $(SP_RT_LIB)
 	grep -q '"line":13,"col":19,.*"kind":"CallNode","name":"dist2","dispatch":"switch","candidates":\["Point#dist2"\]' "$$tmp/et.json" || { echo "infer-test: FAIL (--emit-types: a switch lists its candidate defs)"; ok=0; }; \
 	grep -q '"kind":"DefNode","name":"dist2",.*"owner":"Point","signature":"(untyped) -> Integer","widened":true' "$$tmp/et.json" || { echo "infer-test: FAIL (--emit-types: a def carries its owner and signature)"; ok=0; }; \
 	grep -q '"kind":"DefNode","name":"widen",.*"owner":"Object","signature":"(untyped, Integer) -> untyped","widened":true' "$$tmp/et.json" || { echo "infer-test: FAIL (--emit-types: a top-level def is owned by Object)"; ok=0; }; \
-	grep -q '"kind":"DefNode","name":"x",.*"signature":"() -> Integer"}' "$$tmp/et.json" || { echo "infer-test: FAIL (--emit-types: an unwidened def carries no widened flag)"; ok=0; }; \
+	grep -q '"kind":"DefNode","name":"x",.*"signature":"() -> Integer","return_nullable":false}' "$$tmp/et.json" || { echo "infer-test: FAIL (--emit-types: an unwidened def carries no widened flag)"; ok=0; }; \
 	$(SPINEL) test/infer/emit_types_fields.rb --emit-types -o "$$tmp/et2.json" -S > "$$tmp/et2.c" 2>/dev/null || { echo "infer-test: FAIL (--emit-types -S)"; ok=0; }; \
 	cmp -s "$$tmp/et.json" "$$tmp/et2.json" && grep -q 'sp_Point_dist2' "$$tmp/et2.c" || { echo "infer-test: FAIL (--emit-types -S: the same JSON and the C in one run)"; ok=0; }; \
 	$(SPINEL) test/infer/emit_types_fields.rb -S > "$$tmp/et3.c" 2>/dev/null && cmp -s "$$tmp/et2.c" "$$tmp/et3.c" || { echo "infer-test: FAIL (--emit-types -S: the C is the one -S alone emits, not the debug compile's)"; ok=0; }; \
