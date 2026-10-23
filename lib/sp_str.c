@@ -757,24 +757,36 @@ static void sp_str_piece(sp_StrArray*a,const char*s,const char*p,size_t n){char*
 #else
 static void sp_str_piece(sp_StrArray*a,const char*s,const char*p,size_t n){sp_str_split_push(a,p,n);sp_str_bin_like(s,(char*)a->data[a->len-1]);}
 #endif
+/* The character count that the length cache holds for s, or -1 with none:
+   a probe that never walks the bytes. */
+static sp_int sp_str_lcache_peek(const char*s){
+  if(!sp_str_cacheable(s))return -1;
+  unsigned h=sp_str_lcache_hash(s);
+  for(unsigned w=0;w<SP_STR_LCACHE_WAYS;w++)if(sp_str_lcache[h+w].s==s)return sp_str_lcache[h+w].char_len;
+  return -1;
+}
 /* CRuby refuses to split a UTF-8 String whose bytes are invalid (ArgumentError),
    as a regexp search refuses it (sp_re_check_subject). Fewer characters than
-   bytes is valid text: the length cache answers for the same String again.
-   The bytes answer first, 8 at a time: with no byte from 0x80 up the String
-   is ASCII, so it is valid and takes the 7-bit bit. A String that a split or
-   a gets just made has no bit yet, and this keeps it from two walks of its
-   bytes (the length and the ASCII test) on each check. The 7-bit bit is set
-   on a String the length walk counted as bytes, which an invalid byte makes
-   it do too (sp_str_length), so with it set a byte from 0x80 up is the
-   invalid one. */
+   bytes is valid text: the length cache answers for the same String again,
+   with no walk. Else the bytes answer, 8 at a time, up to the first byte from
+   0x80 up: with none the String is ASCII, so it is valid and takes the 7-bit
+   bit. A String that a split or a gets just made has no bit yet, and this
+   keeps it from two walks of its bytes (the length and the ASCII test) on
+   each check. The 7-bit bit is set on a String the length walk counted as
+   bytes, which an invalid byte makes it do too (sp_str_length), so with it set
+   a byte from 0x80 up is the invalid one. */
 void sp_str_check_valid(const char*s){
   if(!s||sp_str_is_binary(s))return;
-  const unsigned char*p=(const unsigned char*)s,*e=p+sp_str_byte_len(s);
-  uint64_t w,hi=0;
-  for(;p+8<=e;p+=8){memcpy(&w,p,8);hi|=w;}
-  for(;p<e;p++)hi|=*p;
-  if(!(hi&0x8080808080808080ULL)){sp_str_mark_ascii7(s);return;}
-  if(!sp_str_is_ascii7(s)&&(size_t)sp_str_length(s)!=sp_str_byte_len(s))return;
+  size_t bl=sp_str_byte_len(s);
+  if(!sp_str_is_ascii7(s)){sp_int n=sp_str_lcache_peek(s);if(n>=0&&(size_t)n!=bl)return;}
+  const unsigned char*p=(const unsigned char*)s,*e=p+bl;
+  uint64_t w;
+  for(;p+8<=e;p+=8){memcpy(&w,p,8);if(w&0x8080808080808080ULL)goto high;}
+  for(;p<e;p++)if(*p&0x80)goto high;
+  sp_str_mark_ascii7(s);
+  return;
+high:
+  if(!sp_str_is_ascii7(s)&&(size_t)sp_str_length(s)!=bl)return;
   sp_raise_cls("ArgumentError",(&("\xff" "invalid byte sequence in UTF-8")[1]));
 }
 void sp_str_split_into(sp_StrArray*a,const char*s,const char*sep){
