@@ -1,0 +1,25 @@
+1
+2
+"c:2"
+1
+2
+"c"
+"t"
+"t"
+"c2"
+no method secret
+no method nothing
+bump/1 label/1 half/0 twin/0 keys/1 .opts/0 .zero/0 name/0 n/0 tag/0 tag=/1
+2
+"L"
+1
+label/1^ half/0^ twin/0^ keys/1^ .opts/0^ .zero/0^ shout/0 bump/1 name/0^ n/0^ tag/0^ tag=/1^
+"zero"
+"zero:0"
+no method bump
+no method zero
+"a,b"
+raised ArgumentError: wrong number of arguments (given 0, expected 1)
+raised TypeError: no implicit conversion of String into Integer
+raised TypeError: no implicit conversion of Integer into Hash
+0

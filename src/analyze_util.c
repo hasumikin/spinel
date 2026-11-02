@@ -6322,3 +6322,72 @@ int capture_cells_shape(const NodeTable *nt, int id) {
 }
 /* See analyze_internal.h. */
 int respond_to_missing_defined(Compiler *c) { return !an_name_binder_free(c, "respond_to_missing?"); }
+
+/* ---- --ext-class: the instance methods a host calls by name ----
+
+   A library (--ext-init) exports the module methods --ext-entry names in
+   their C signatures. A host that holds an object of the program (an entry
+   answered it) has no way to call the object's methods: every call the
+   program makes is a direct C call, and the poly dispatch of a boxed
+   receiver is a switch the call site owns. --ext-class names the classes
+   whose public instance methods the library also exports in a table of
+   (name, arity, thunk), read by sp_ext_send and sp_ext_methods
+   (ext_emit_method_tables, codegen.c). */
+
+/* A kind a boxed value converts to and from: a builtin kind with a traits
+   row, an object of the program, or an array of such objects. */
+int ext_ty_crosses(TyKind t) {
+  return ty_traits_of(t) != NULL || ty_is_object(t) || ty_is_ptr_array(t);
+}
+
+/* Whether the list names class_id: a class or module of the program (not
+   a reopened builtin, not a package's native class). A module exports its
+   singleton methods only. */
+int ext_class_exported(Compiler *c, int class_id) {
+  if (!g_ext_classes || !*g_ext_classes || class_id < 0 || class_id >= c->nclasses) return 0;
+  ClassInfo *ci = &c->classes[class_id];
+  if (!ci->name || is_builtin_reopen(ci->name) || ci->is_native_class) return 0;
+  if (sp_streq(g_ext_classes, "all")) return 1;
+  size_t n = strlen(ci->name);
+  for (const char *p = g_ext_classes; *p; ) {
+    const char *e = strchr(p, ',');
+    size_t len = e ? (size_t)(e - p) : strlen(p);
+    if (len == n && !strncmp(p, ci->name, n)) return 1;
+    if (!e) break;
+    p = e + 1;
+  }
+  return 0;
+}
+
+/* Whether scope si is the method the chain of class_id answers for its
+   name, public there, and of a shape the thunk can call: fixed positional
+   parameters (no optional, rest, keyword or block parameter, no yield),
+   and, when `typed` (after inference; the roots are marked before it),
+   each of a kind that crosses, and a result that crosses or is none. */
+int ext_method_exported(Compiler *c, int class_id, int si, int typed) {
+  if (si <= 0 || si >= c->nscopes) return 0;
+  Scope *sc = &c->scopes[si];
+  if (!sc->name || sc->class_id < 0 || is_initialize_name(sc->name)) return 0;
+  if (sc->replaced || sc->entry != ENTRY_NONE) return 0;
+  if (sc->is_cmethod) {
+    /* a singleton method: the one the class (or module) answers by name */
+    int at = -1;
+    if (comp_cmethod_in_chain(c, class_id, sc->name, NULL) != si) return 0;
+    if (comp_cmethod_vis_declared(c, class_id, sc->name, &at) != SP_VIS_PUBLIC) return 0;
+  }
+  else {
+    if (comp_class_is_module(c, &c->classes[class_id])) return 0;   /* no instance */
+    if (comp_method_in_chain(c, class_id, sc->name, NULL) != si) return 0;
+    if (comp_method_vis_in_chain(c, class_id, sc->name) != SP_VIS_PUBLIC) return 0;
+  }
+  if (sc->rest_idx >= 0 || sc->kwrest_idx >= 0 || sc->nrequired != sc->nparams || sc->ps_nkw > 0 ||
+      (sc->blk_param && sc->blk_param[0]) || sc->yields)
+    return 0;
+  if (!typed) return 1;
+  for (int p = 0; p < sc->nparams; p++) {
+    LocalVar *lv = scope_local(sc, sc->pnames[p]);
+    if (!lv || !ext_ty_crosses(lv->type)) return 0;
+  }
+  if (sc->ret != TY_VOID && sc->ret != TY_NIL && !ext_ty_crosses(sc->ret)) return 0;
+  return 1;
+}

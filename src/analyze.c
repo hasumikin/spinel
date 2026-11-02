@@ -1142,7 +1142,7 @@ static void cr_live_begin(CrLive *lv, Compiler *c, int *queue, int *qtail) {
         if (k != sc->class_id && cr_live_descends(c, k, sc->class_id) && lv->pend_c[k] != -2) {
           lv->held_c[k] = lv->held_i[k] = 0; lv->pend_c[k] = -2;
         }
-    if (sc->is_ext_entry && sc->class_id >= 0 && lv->pend_c[sc->class_id] != -2) {
+    if ((sc->is_ext_entry || sc->is_ext_method) && sc->class_id >= 0 && lv->pend_c[sc->class_id] != -2) {
       lv->held_c[sc->class_id] = lv->held_i[sc->class_id] = 0; lv->pend_c[sc->class_id] = -2;
     }
   }
@@ -1296,6 +1296,26 @@ void compute_reachable(Compiler *c, int typed) {
       c->scopes[mi2].is_ext_entry = 1;
     }
   }
+  /* --ext-class: the public instance methods of the named classes join the
+     graph as roots too, for the method table the library exports */
+  if (g_ext_classes && *g_ext_classes) {
+    if (!sp_streq(g_ext_classes, "all")) {
+      char list[2048];
+      snprintf(list, sizeof list, "%s", g_ext_classes);
+      for (char *tok = strtok(list, ","); tok; tok = strtok(NULL, ",")) {
+        int ci2 = comp_class_index(c, tok);
+        if (ci2 < 0 || !ext_class_exported(c, ci2)) {
+          fprintf(stderr, "spinel: --ext-class `%s` does not name a class of the program\n", tok);
+          exit(1);
+        }
+      }
+    }
+    for (int ci2 = 0; ci2 < c->nclasses; ci2++) {
+      if (!ext_class_exported(c, ci2)) continue;
+      for (int s = 1; s < c->nscopes; s++)
+        if (ext_method_exported(c, ci2, s, 0)) c->scopes[s].is_ext_method = 1;
+    }
+  }
   for (int s = 0; s < c->nscopes; s++) { c->scopes[s].reachable = 0; comp_touch_scope(c->scopes[s].idx); }
   for (int s = 0; s < c->nscopes; s++) {
     Scope *sc = &c->scopes[s];
@@ -1305,7 +1325,8 @@ void compute_reachable(Compiler *c, int typed) {
        of the program the message of an exception class. (A replaced version,
        or a version entry, is reached only by the calls bound to it.) */
     int bound = sc->replaced || sc->entry != ENTRY_NONE;
-    int is_root = (s == 0 || !sc->name || (!bound && is_initialize_name(sc->name)) || sc->is_ext_entry);
+    int is_root = (s == 0 || !sc->name || (!bound && is_initialize_name(sc->name)) || sc->is_ext_entry ||
+                   sc->is_ext_method);
     if (is_root) cr_live_reach(&lv, s);
   }
 
@@ -17266,7 +17287,7 @@ static void oa_byname_free(OaByName *b) { anh_free(&b->names); free(b->first); f
    and a lowered yield. sh_settle_reads counts the same methods as read. */
 static int oa_entered_unseen(const Scope *sc) {
   const char *nm = sc->name;
-  if (sc->is_ext_entry || sc->is_proc_form || sc->is_lowered_yield) return 1;
+  if (sc->is_ext_entry || sc->is_ext_method || sc->is_proc_form || sc->is_lowered_yield) return 1;
   if (method_name_implicitly_invoked(nm) || sp_streq(nm, "method_missing") ||
       sp_streq(nm, "deconstruct") || sp_streq(nm, "deconstruct_keys")) return 1;
   if (!(nm[0] == '_' || (nm[0] >= 'a' && nm[0] <= 'z') || (nm[0] >= 'A' && nm[0] <= 'Z'))) return 1;
@@ -29653,7 +29674,7 @@ static int narrow_params_from_arrays(Compiler *c) {
       if (!m->pnames[pj]) continue;
       if (m->name && (method_name_implicitly_invoked(m->name) ||
                       anh_has(&supern, m->name))) continue;
-      if (m->is_ext_entry) continue;
+      if (m->is_ext_entry || m->is_ext_method) continue;
       LocalVar *p = scope_local(m, m->pnames[pj]);
       if (!p || p->type != TY_POLY) continue;
       if (p->is_block_param || p->rbs_seeded || p->poly_dispatch_widened) continue;
@@ -51275,7 +51296,8 @@ static int ur_name_excluded(const char *nm) {
 static int ur_candidate(Compiler *c, const Scope *s) {
   return s->ret == TY_STRING && s->name && s->def_node >= 0 && nt_kind(c->nt, s->def_node) == NK_DefNode &&
          nt_str(c->nt, s->def_node, "name") && sp_streq(nt_str(c->nt, s->def_node, "name"), s->name) &&
-         s->body >= 0 && !s->yields && !s->is_proc_form && !s->cs_synth && !s->is_ext_entry && !s->entry &&
+         s->body >= 0 && !s->yields && !s->is_proc_form && !s->cs_synth && !s->is_ext_entry && !s->is_ext_method &&
+         !s->entry &&
          !ur_name_excluded(s->name);
 }
 /* the builtin iterators that drop their block's value */

@@ -62,6 +62,7 @@ extern int g_inline_hot;
 extern int g_no_write_barrier;
 extern const char *g_ext_init_name;
 extern const char *g_ext_entries;
+extern const char *g_ext_classes;
 extern const char *g_ext_target;
 extern const char *g_ext_feature;
 extern char *g_ext_header_text;
@@ -524,6 +525,8 @@ static void usage(void) {
     "               statement of a method, when the method is called)\n"
     "  --ext-init NAME    Emit a host-callable library: NAME() replaces main\n"
     "  --ext-entry M.m,.. Export these module methods (with -c; writes a .h contract)\n"
+    "  --ext-class C,..   Export the instance methods of these classes (or `all`)\n"
+    "               by name: sp_ext_send and sp_ext_methods in the contract\n"
     "  --ext cruby        Also generate the CRuby extension shim (<out>_ext.c)\n"
     "  --no-inline-hot  Do not force small leaf methods inline (default: do).\n"
     "                 Forcing is worth a sixth of optcarrot's frame rate and\n"
@@ -1042,6 +1045,7 @@ int main(int argc, char **argv) {
        main), --ext-entry designates the exported methods. */
     else if (sp_streq(a, "--ext-init") && i + 1 < argc) { g_ext_init_name = argv[i + 1]; i += 2; }
     else if (sp_streq(a, "--ext-entry") && i + 1 < argc) { g_ext_entries = argv[i + 1]; i += 2; }
+    else if (sp_streq(a, "--ext-class") && i + 1 < argc) { g_ext_classes = argv[i + 1]; i += 2; }
     else if (sp_streq(a, "--ext") && i + 1 < argc) { g_ext_target = argv[i + 1]; i += 2; }
     else if (parse_flag(a))                { i++; }
     else if (sp_streq(a, "-c"))            { c_only = 1; i++; }
@@ -1359,14 +1363,14 @@ int main(int argc, char **argv) {
 
   if (stdout_mode) { fputs(csrc, stdout); free(csrc); return 0; }
 
-  if ((g_ext_init_name || g_ext_entries) && !c_only) {
+  if ((g_ext_init_name || g_ext_entries || g_ext_classes) && !c_only) {
     fprintf(stderr, "spinel: --ext-init/--ext-entry emit a LIBRARY: pass -c "
                     "(the host's build compiles and links the result)\n");
     free(csrc);
     return 1;
   }
-  if (g_ext_entries && !g_ext_init_name) {
-    fprintf(stderr, "spinel: --ext-entry needs --ext-init (the host must "
+  if ((g_ext_entries || g_ext_classes) && !g_ext_init_name) {
+    fprintf(stderr, "spinel: --ext-entry and --ext-class need --ext-init (the host must "
                     "initialize the runtime before calling an entry)\n");
     free(csrc);
     return 1;
