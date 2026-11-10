@@ -9,11 +9,6 @@
 #include "value_pos.h"
 #include <errno.h>
 
-/* One representation: a block parameter bound to a typed String Array's
-   element (the split, scan and upto forms) holds the handle the Array keeps,
-   so a change through it shows in the Array; its slot is the handle's. */
-static TyKind one_elem_bind_type(TyKind et) { return et == TY_STRING ? TY_STRBUF : et; }
-
 /* Is `s` the C text of an integer literal (`589LL`, `-8LL`, `(-8LL)`)? Its
    value in *v. */
 static int c_int_literal_text(const char *s, long long *v) {
@@ -263,26 +258,8 @@ static void yield_target_restore(const YieldTargetSave *s) {
   g_yield_proc_ref_fallback2 = s->ypr; g_yield_slot_ty_fallback2 = s->yslot;
   g_yield_lowered_fallback = s->lowered; g_yield_lowered_blk_fallback = s->lowered_blk;
 }
-/* The whole block context an inline runs its callee's body under: the block
-   current and what its splice binds, the one level out, the forwarded proc
-   and the lowered context, and the break scope a block's `break` leaves.
-   emit_inline_call_x takes a snapshot of the caller's before it switches to
-   the callee's, and puts the caller's back for the call-site code it emits
-   in between (see there). */
-typedef struct {
-  int block_id, block_nren, ytgt_cur;
-  const char *block_param_name, *block_owner_param_name;
-  int yfb, yfb_nren; const char *yfb_owner;
-  const char *blk_brk_fb; int blk_brk_efb;
-  const char *self_fb, *self_deref_fb; int emcls_fb;
-  const char *self_fb2, *self_deref_fb2; int emcls_fb2;
-  int lowered; const char *lowered_blk;
-  int lowered_fb; const char *lowered_blk_fb;
-  const char *ypr, *ypr_expr_ref; int ypr_expr; TyKind yslot;
-  const char *ypr_fb, *ypr_fb2; TyKind yslot_fb, yslot_fb2;
-  const char *brk_var, *ser_var; int brk_ebase, brk_exc_base, brk_rescue_base;
-} InlineBlockCtx;
-static void inline_block_ctx_save(InlineBlockCtx *s) {
+/* Snapshot and restore of the block context (InlineBlockCtx, codegen_internal.h). */
+void inline_block_ctx_save(InlineBlockCtx *s) {
   s->block_id = g_block_id; s->block_nren = g_block_nren; s->ytgt_cur = g_ytgt_cur;
   s->block_param_name = g_block_param_name; s->block_owner_param_name = g_block_owner_param_name;
   s->yfb = g_yield_block_fallback; s->yfb_nren = g_yield_block_fallback_nren;
@@ -301,7 +278,7 @@ static void inline_block_ctx_save(InlineBlockCtx *s) {
   s->brk_var = g_block_brk_var; s->ser_var = g_brk_ser_var; s->brk_ebase = g_block_brk_ebase;
   s->brk_exc_base = g_block_brk_exc_base; s->brk_rescue_base = g_block_brk_rescue_base;
 }
-static void inline_block_ctx_restore(const InlineBlockCtx *s) {
+void inline_block_ctx_restore(const InlineBlockCtx *s) {
   g_block_id = s->block_id; g_block_nren = s->block_nren; g_ytgt_cur = s->ytgt_cur;
   g_block_param_name = s->block_param_name; g_block_owner_param_name = s->block_owner_param_name;
   g_yield_block_fallback = s->yfb; g_yield_block_fallback_nren = s->yfb_nren;
@@ -817,8 +794,8 @@ void emit_inline_locals_aliased(Compiler *c, int mi, int tag, unsigned alias_mas
            both across the same setjmp as ordinary inline locals (#6552).
            Nested inlines must also retain the borrowed slot's qualifier. */
         emit_indent(b, din);
-        buf_printf(b, "%s *%s _cell_%s = NULL;\n",
-                   borrowed_string_type(lv), vol ? " volatile" : "", rn);
+        buf_printf(b, "const char * *%s _cell_%s = NULL;\n",
+                   vol ? " volatile" : "", rn);
         continue;
       }
     }
@@ -829,8 +806,8 @@ void emit_inline_locals_aliased(Compiler *c, int mi, int tag, unsigned alias_mas
 void emit_inline_alias_arg(Compiler *c, int av, Buf *b) {
   const NodeTable *nt = c->nt;
   if (nt_kind(nt, av) == NK_InstanceVariableReadNode) {
-    /* the slot itself, and the owner pinned as a byref call pins it: the
-       store lands inside this expansion, past any dirty bit (#4378) */
+    /* the slot itself, and the owner pinned: the store lands inside this
+       expansion, past any dirty bit (#4378) */
     const char *ivn = nt_str(nt, av, "name");
     /* a C global is a root every collection marks: no owner to pin */
     Buf gref; memset(&gref, 0, sizeof gref);
@@ -841,12 +818,11 @@ void emit_inline_alias_arg(Compiler *c, int av, Buf *b) {
   emit_expr(c, av, b); buf_puts(b, ")");
   /* The caller's variable may be a heap cell (captured by a proc): the
      body will store through it from inside this expansion, which is the
-     placement a dirty bit cannot cover, so pin the cell as a byref call
-     would (#4391); a stack slot, or a cell the caller itself was lent,
-     is not ours to pin. */
+     placement a dirty bit cannot cover, so pin the cell (#4391); a cell
+     the caller itself was lent is not ours to pin. */
   const char *avn = nt_str(nt, av, "name");
   LocalVar *alv = avn ? scope_local(comp_scope_of(c, av), avn) : NULL;
-  if (alv && alv->is_cell && !alv->byref_out && !alv->inline_alias &&
+  if (alv && alv->is_cell && !alv->inline_alias &&
       !(g_cap_struct && g_cap_names && nameset_has(g_cap_names, avn)))
     buf_printf(b, "; sp_gc_pin_remembered((void *)_cell_%s)", rename_local(avn));
 }
@@ -2346,7 +2322,7 @@ void emit_block_kw_binds(Compiler *c, int blk, int ykw, Scope *bsc, Buf *b, int 
     if (kw_alias && al->n < (int)(sizeof al->nm / sizeof al->nm[0])) {
       if (!as_expr) emit_indent(b, indent);
       if (!as_expr && !al->open) { buf_puts(b, "{\n"); emit_indent(b, indent); al->open = 1; }
-      buf_printf(b, "%s *_cell_%s = &(", borrowed_string_type(kl), kpr);
+      buf_printf(b, "const char * *_cell_%s = &(", kpr);
       emit_expr(c, vn, b);
       buf_puts(b, ")");
       buf_puts(b, as_expr ? "; " : ";\n");
@@ -2509,7 +2485,7 @@ static int emit_block_post_alias(Compiler *c, int blk, const char *bp, const cha
   refuse_alias_of_snapshot(c, yarg, bp);
   if (!as_expr) emit_indent(b, indent);
   if (!as_expr && !al->open) { buf_puts(b, "{\n"); emit_indent(b, indent); al->open = 1; }
-  buf_printf(b, "%s *_cell_%s = &(", borrowed_string_type(bl), bpr);
+  buf_printf(b, "const char * *_cell_%s = &(", bpr);
   emit_expr(c, yarg, b);
   buf_puts(b, ")");
   buf_puts(b, as_expr ? "; " : ";\n");
@@ -3064,7 +3040,7 @@ void emit_block_binds(Compiler *c, int blk, const int *yargs, int yc,
       gref.p = NULL;
       if (bl && al && al->n < (int)(sizeof al->nm / sizeof al->nm[0])) {
         if (!as_expr && !al->open) { buf_puts(b, "{\n"); emit_indent(b, indent); al->open = 1; }
-        buf_printf(b, "%s *_cell_%s = &(", borrowed_string_type(bl), bpr);
+        buf_printf(b, "const char * *_cell_%s = &(", bpr);
         emit_expr(c, yargs[k], b);
         buf_puts(b, ")");
         buf_puts(b, as_expr ? "; " : ";\n");
@@ -3156,7 +3132,7 @@ void emit_block_binds(Compiler *c, int blk, const int *yargs, int yc,
       refuse_alias_of_snapshot(c, yargs[yi], op);
       if (!as_expr) emit_indent(b, indent);
       if (!as_expr && !al->open) { buf_puts(b, "{\n"); emit_indent(b, indent); al->open = 1; }
-      buf_printf(b, "%s *_cell_%s = &(", borrowed_string_type(ol), opr);
+      buf_printf(b, "const char * *_cell_%s = &(", opr);
       emit_expr(c, yargs[yi], b);
       buf_puts(b, ")");
       buf_puts(b, as_expr ? "; " : ";\n");
@@ -3199,20 +3175,10 @@ void emit_block_binds(Compiler *c, int blk, const int *yargs, int yc,
     buf_printf(b, "sp_PolyArray *_t%d = sp_PolyArray_new();%s", trest, as_expr ? " " : "\n");
     if (!as_expr) emit_indent(b, indent);
     buf_printf(b, "SP_GC_ROOT(_t%d);%s", trest, as_expr ? " " : "\n");
-    /* a rest whose elements are the rule's handles takes an ivar's handle
-       itself (a local's boxes as its handle already) */
-    LocalVar *rlv = bsc ? scope_local(bsc, brest) : NULL;
-    int rest_handles = repr_of_slot(c, rlv).elems_handle;
     for (int j = P + ot_static; j < yc - Q; j++) {
       if (!as_expr) emit_indent(b, indent);
       buf_printf(b, "sp_PolyArray_push(_t%d, ", trest);
-      int vt[2], nv = 0;
-      if (rest_handles && !c->strbuf_box[yargs[j]] && ivar_read_is_handle(c, yargs[j])) {
-        vt[nv++] = view_push_repr(c, yargs[j], VR_STRBUF_BOX, 1);
-        vt[nv++] = view_push(c, yargs[j], TY_STRBUF);
-      }
       emit_boxed(c, yargs[j], b);
-      while (nv > 0) view_pop(c, vt[--nv]);
       buf_puts(b, as_expr ? "); " : ");\n");
     }
     rest_tmp = trest;
@@ -5831,9 +5797,12 @@ int emit_array_filter_loop(Compiler *c, int recv, int block, TyKind rt, const ch
    param was still inferred as the receiver's element type. Assigning the
    box into that slot does not compile. Narrow it, keeping nil as the
    slot's own nil so a shorter operand still yields nil. */
-static void emit_zip_block_param(Compiler *c, TyKind slot, TyKind src_ty,
-                                 const char *src, Buf *b) {
+void emit_zip_block_param(Compiler *c, TyKind slot, TyKind src_ty,
+                          const char *src, Buf *b) {
   if (slot == TY_POLY && src_ty != TY_POLY) emit_boxed_elem_read(c, src_ty, src, b);
+  /* a String element into a param held as a String handle (one the block
+     stores or mutates), as the each walk binds it */
+  else if (slot == TY_STRBUF && src_ty == TY_STRING) buf_printf(b, "sp_String_new_shared(%s)", src);
   else if (src_ty == TY_POLY && slot != TY_POLY && slot != TY_UNKNOWN)
     emit_unbox_nilable_text(c, slot, src, b);
   else buf_puts(b, src);
@@ -6093,6 +6062,25 @@ static void emit_row_optional_binds(Compiler *c, int block, int np, const char *
   }
 }
 
+/* A String receiver that builds a String (`s.b`, a method's result) beside
+   an argument that allocates too (a separator or pattern built the same
+   way): held and rooted first, its text in rb replaced by the temp's, as
+   the expression arms hold it (operand_allocates_beside). The block forms
+   below splice the receiver into one call with the argument, and C
+   evaluates them in no set order: the one built first was nobody's while
+   the other allocated. */
+static void iter_hold_built_str_recv(Compiler *c, int recv, const int *argv, int argc, Buf *rb, Buf *b, int indent) {
+  if (!operand_may_allocate(c, recv)) return;
+  int beside = 0;
+  for (int ai = 0; ai < argc && !beside; ai++) beside = operand_allocates_beside(c, argv[ai]);
+  if (!beside) return;
+  int th = ++g_tmp;
+  emit_indent(b, indent);
+  buf_printf(b, "const char *_t%d = SP_STR_B(%s); SP_GC_ROOT(_t%d);\n", th, rb->p ? rb->p : "", th);
+  free(rb->p); memset(rb, 0, sizeof *rb);
+  buf_printf(rb, "_t%d", th);
+}
+
 /* emit_iteration_stmt_body's tap, Array#each_slice, and String#split / scan
    with a block (answers 1 emitted, 0 declined, -1 to go on) */
 static int iter_tap_slice_string_arms(Compiler *c, int id, Buf *b, int indent, const NodeTable *nt, int block, const char *name, int recv, int body, const char *p0_orig, const char *p0, TyKind rt) {
@@ -6283,6 +6271,7 @@ static int iter_tap_slice_string_arms(Compiler *c, int id, Buf *b, int indent, c
     int use_shadow_sp = clv0 && clv0->type != et && et != TY_UNKNOWN;
     int tm = ++g_tmp, ti = ++g_tmp;
     Buf rb; memset(&rb, 0, sizeof rb); emit_expr(c, recv, &rb);
+    iter_hold_built_str_recv(c, recv, sp_argv, sp_argc, &rb, b, indent);
     emit_indent(b, indent);
     buf_printf(b, "sp_StrArray *_t%d = ", tm);
     if (sp_argc == 0) buf_printf(b, "sp_str_split_ws(%s);\n", rb.p ? rb.p : "");
@@ -6325,14 +6314,15 @@ static int iter_tap_slice_string_arms(Compiler *c, int id, Buf *b, int indent, c
     int spIndent = indent + 1;
     if (use_shadow_sp) {
       int sb_bn = 0; const int *sb_bb = body >= 0 ? nt_arr(nt, body, "body", &sb_bn) : NULL;
-      /* (one representation: the element is the handle, and so is the
-         parameter that holds it, its body inferred over that slot) */
-      TyKind bt = one_elem_bind_type(et); int ss0 = clv0->str_shared;
-      if (bt == TY_STRBUF) { clv0->str_shared = 1; comp_touch_scope(clv0->owner); }
-      lv_set_type(clv0, bt);
-      arm_body_infer(c, ARM_SITE_SPLIT, block, bt, sb_bb, sb_bn);
+      /* (the element is the handle the Array keeps, so a change through the
+         parameter shows in the Array, and so is the parameter that holds
+         it, its body inferred over that slot) */
+      int ss0 = clv0->str_shared;
+      clv0->str_shared = 1; comp_touch_scope(clv0->owner);
+      lv_set_type(clv0, TY_STRBUF);
+      arm_body_infer(c, ARM_SITE_SPLIT, block, TY_STRBUF, sb_bb, sb_bn);
       emit_indent(b, spIndent); buf_puts(b, "{\n"); spIndent++;
-      emit_indent(b, spIndent); buf_printf(b, bt == TY_STRBUF ? "sp_String *lv_%s = sp_StrArray_get_e(_t%d, _t%d);\n" : "const char *lv_%s = sp_StrArray_get(_t%d, _t%d);\n", p0, tm, ti);
+      emit_indent(b, spIndent); buf_printf(b, "sp_String *lv_%s = sp_StrArray_get_e(_t%d, _t%d);\n", p0, tm, ti);
       emit_loop_body(c, body, b, spIndent);
       spIndent--;
       emit_indent(b, spIndent); buf_puts(b, "}\n");
@@ -6381,6 +6371,7 @@ static int iter_tap_slice_string_arms(Compiler *c, int id, Buf *b, int indent, c
     int live = sc_re >= 0;
     char sc_get[96], sc_get_e[96];
     Buf rb; memset(&rb, 0, sizeof rb); emit_expr(c, recv, &rb);
+    if (!live) iter_hold_built_str_recv(c, recv, sc_argv, 1, &rb, b, indent);
     emit_indent(b, indent);
     if (live) {
       int th = ++g_tmp;
@@ -6415,12 +6406,12 @@ static int iter_tap_slice_string_arms(Compiler *c, int id, Buf *b, int indent, c
     int bodyIndent = indent + 1;
     if (use_shadow_sc) {
       int scb_bn = 0; const int *scb_bb = body >= 0 ? nt_arr(nt, body, "body", &scb_bn) : NULL;
-      TyKind bt = one_elem_bind_type(et); int ss0 = clv0->str_shared;   /* (one representation: see the split form) */
-      if (bt == TY_STRBUF) { clv0->str_shared = 1; comp_touch_scope(clv0->owner); }
-      lv_set_type(clv0, bt);
-      arm_body_infer(c, ARM_SITE_SCAN, block, bt, scb_bb, scb_bn);
+      int ss0 = clv0->str_shared;   /* (see the split form) */
+      clv0->str_shared = 1; comp_touch_scope(clv0->owner);
+      lv_set_type(clv0, TY_STRBUF);
+      arm_body_infer(c, ARM_SITE_SCAN, block, TY_STRBUF, scb_bb, scb_bn);
       emit_indent(b, bodyIndent); buf_puts(b, "{\n"); bodyIndent++;
-      emit_indent(b, bodyIndent); buf_printf(b, bt == TY_STRBUF ? "sp_String *lv_%s = %s;\n" : "const char *lv_%s = %s;\n", p0, bt == TY_STRBUF ? sc_get_e : sc_get);
+      emit_indent(b, bodyIndent); buf_printf(b, "sp_String *lv_%s = %s;\n", p0, sc_get_e);
       emit_loop_body(c, body, b, bodyIndent);
       bodyIndent--;
       emit_indent(b, bodyIndent); buf_puts(b, "}\n");
@@ -6506,12 +6497,12 @@ static int iter_range_upto_arms(Compiler *c, int id, Buf *b, int indent, const N
         buf_printf(b, "for (sp_int _t%d = 0; _t%d < _t%d->len; _t%d++) {\n", ti, ti, ta, ti);
         if (use_shadow) {
           int sbn = 0; const int *sbb = body >= 0 ? nt_arr(nt, body, "body", &sbn) : NULL;
-          TyKind bt = one_elem_bind_type(TY_STRING); int ss0 = slv->str_shared;   /* (one representation: see the split form) */
-          if (bt == TY_STRBUF) { slv->str_shared = 1; comp_touch_scope(slv->owner); }
-          lv_set_type(slv, bt);
-          arm_body_infer(c, ARM_SITE_STR_UPTO, block, bt, sbb, sbn);
+          int ss0 = slv->str_shared;   /* (see the split form) */
+          slv->str_shared = 1; comp_touch_scope(slv->owner);
+          lv_set_type(slv, TY_STRBUF);
+          arm_body_infer(c, ARM_SITE_STR_UPTO, block, TY_STRBUF, sbb, sbn);
           emit_indent(b, indent + 1);
-          buf_printf(b, bt == TY_STRBUF ? "sp_String *lv_%s = sp_StrArray_get_e(_t%d, _t%d);\n" : "const char *lv_%s = sp_StrArray_get(_t%d, _t%d);\n", p0, ta, ti);
+          buf_printf(b, "sp_String *lv_%s = sp_StrArray_get_e(_t%d, _t%d);\n", p0, ta, ti);
           emit_loop_body(c, body, b, indent + 1);
           lv_set_type(slv, saved); { slv->str_shared = ss0; comp_touch_scope(slv->owner); }
         }
@@ -7070,11 +7061,15 @@ static int iter_enum_poly_walk_arms(Compiler *c, int id, Buf *b, int indent, con
     /* an Integer or Float array the loop's region caches (hc_iter_begin)
        is walked through that header, as a while loop's reads are: its
        length and its elements below the nil-free length, the rest by the
-       accessor as before */
+       accessor as before. A String or object array (or a table) has no
+       nil-free length (hc_ptr_array, hp): every element below the held
+       length is read where the header holds it. */
     char hd[48] = "", hl[48], hw[48], hr[48];
+    int hp = 0;
     if (!rev && (rt == TY_INT_ARRAY || rt == TY_FLOAT_ARRAY) &&
         hc_array(c, recv, rt == TY_FLOAT_ARRAY, hd, hl, hw, sizeof hd))
       hc_read_len(hd, hr, sizeof hr);
+    else if (!rev && hc_ptr_array(c, recv, hd, hl, sizeof hd)) hp = 1;
     emit_indent(b, indent);
     if (rev) buf_printf(b, "for (sp_int _t%d = _t%d - 1; _t%d >= 0; _t%d--) {\n", t, tn, t, t);
     else if (hd[0]) buf_printf(b, "for (sp_int _t%d = 0; _t%d < %s; _t%d++) {\n", t, t, hl, t);
@@ -7164,10 +7159,13 @@ static int iter_enum_poly_walk_arms(Compiler *c, int id, Buf *b, int indent, con
         int o0 = (sp_streq(k, "Int") || sp_streq(k, "Float")) && block_param_slot_is_oint(c, block, 0);
         /* an oint slot reads the element with its nil (oget) */
         /* (one representation: the element into a slot of either face, SP_STR_TO) */
-        if (sp_streq(k, "Str")) {
+        if (sp_streq(k, "Str") && hp)
+          buf_printf(b, "lv_%s = SP_STR_TO(lv_%s, SP_SEB((sp_strelem)%s[_t%d]));\n", p0, p0, hd, t);
+        else if (sp_streq(k, "Str")) {
           buf_printf(b, "lv_%s = SP_STR_TO(lv_%s, sp_StrArray_get(", p0, p0);
           buf_puts(b, rb.p); buf_printf(b, ", _t%d));\n", t);
         }
+        else if (hp) buf_printf(b, "lv_%s = %s[_t%d];\n", p0, hd, t);
         else if (hd[0] && !o0)
           buf_printf(b, "lv_%s = SP_LIKELY((unsigned long long)_t%d < (unsigned long long)%s) ? %s[_t%d] : sp_%sArray_get(%s, _t%d);\n",
                      p0, t, hr, hd, t, k, rb.p, t);

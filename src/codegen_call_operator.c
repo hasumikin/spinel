@@ -482,6 +482,31 @@ static int emit_untyped_recv_cmp(Compiler *c, const char *name, int recv, int ar
   return 1;
 }
 
+/* The element walk of a boxed quantifier (any?, all?, none?, one?) over
+   receiver temp _t<ta>: the statements that count its truthy elements (with a
+   pattern temp tp > 0, the ones it matches with ===) into _t<tcnt>, out of
+   _t<tn>, and in ans the answer to read after them. The boxed call's own arm
+   and the poly dispatch's default arm (codegen_poly_plan.c) both walk it. */
+void emit_poly_quantifier_walk(Compiler *c, int id, int ta, int tp, int tn, int tcnt, int ti,
+                               const char *name, char *ans, size_t cap, Buf *b) {
+  emit_poly_iter_obj_reject(c, id, ta, name, b);
+  emit_poly_iter_obj_normalize(c, ta, b);
+  /* the same receiver check the each emitter makes: nil is no collection,
+     and a zero-length loop answered `nil.any?` false and `nil.all?` true
+     (#4485) */
+  buf_printf(b, "sp_poly_iter_check(_t%d, \"%s\"); ", ta, name);
+  buf_printf(b, "sp_int _t%d = sp_poly_arr_len_ex(_t%d); sp_int _t%d = 0;"
+                " for (sp_int _t%d = 0; _t%d < _t%d; _t%d++)"
+                " if (", tn, ta, tcnt, ti, ti, tn, ti);
+  if (tp > 0) buf_printf(b, "sp_poly_case_eq(_t%d, sp_poly_each_elem(_t%d, _t%d))", tp, ta, ti);
+  else buf_printf(b, "sp_poly_truthy(sp_poly_each_elem(_t%d, _t%d))", ta, ti);
+  buf_printf(b, ") _t%d++; ", tcnt);
+  if (sp_streq(name, "any?"))       snprintf(ans, cap, "_t%d > 0", tcnt);
+  else if (sp_streq(name, "all?"))  snprintf(ans, cap, "_t%d == _t%d", tcnt, tn);
+  else if (sp_streq(name, "none?")) snprintf(ans, cap, "_t%d == 0", tcnt);
+  else                              snprintf(ans, cap, "_t%d == 1", tcnt);
+}
+
 int emit_call_compare_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv, TyKind rt) {
   if (emit_compare_lead_arms(c, id, name, recv, argc, argv, rt, b)) return 1;
   if (emit_builtin_recv_cmp_raise(c, name, recv, argc, argv, rt, b)) return 1;
@@ -666,22 +691,10 @@ int emit_call_compare_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
       buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d); sp_RbVal _t%d = ", ta, tp); emit_boxed(c, argv[0], b);
       buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d)", tp);
     }
-    buf_puts(b, "; "); emit_poly_iter_obj_reject(c, id, ta, name, b);
-    emit_poly_iter_obj_normalize(c, ta, b);
-    /* the same receiver check the each emitter makes: nil is no collection,
-       and a zero-length loop answered `nil.any?` false and `nil.all?` true
-       (#4485) */
-    buf_printf(b, "sp_poly_iter_check(_t%d, \"%s\"); ", ta, name);
-    buf_printf(b, "sp_int _t%d = sp_poly_arr_len_ex(_t%d); sp_int _t%d = 0;"
-                  " for (sp_int _t%d = 0; _t%d < _t%d; _t%d++)"
-                  " if (", tn, ta, tcnt, ti, ti, tn, ti);
-    if (argc == 1) buf_printf(b, "sp_poly_case_eq(_t%d, sp_poly_each_elem(_t%d, _t%d))", tp, ta, ti);
-    else buf_printf(b, "sp_poly_truthy(sp_poly_each_elem(_t%d, _t%d))", ta, ti);
-    buf_printf(b, ") _t%d++; ", tcnt);
-    if (sp_streq(name, "any?"))       buf_printf(b, "_t%d > 0; })", tcnt);
-    else if (sp_streq(name, "all?"))  buf_printf(b, "_t%d == _t%d; })", tcnt, tn);
-    else if (sp_streq(name, "none?")) buf_printf(b, "_t%d == 0; })", tcnt);
-    else                              buf_printf(b, "_t%d == 1; })", tcnt);
+    char ans[96];
+    buf_puts(b, "; ");
+    emit_poly_quantifier_walk(c, id, ta, argc == 1 ? tp : -1, tn, tcnt, ti, name, ans, sizeof ans, b);
+    buf_printf(b, "%s; })", ans);
     return 1;
   }
 
@@ -1939,13 +1952,23 @@ int emit_call_operator_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
     return 1;
   }
 
-  /* default Object#<=>: 0 when the operands are the same object, nil otherwise
-     (identity). Only for a reference user object with no user `<=>` (#2686). */
+  /* default Object#<=>: 0 when the operands are the same object or ==, nil
+     otherwise. Only for a reference user object with no user `<=>` (#2686). */
   if (sp_streq(name, "<=>") && argc == 1 && recv >= 0 && ty_is_object(rt) &&
       !comp_ty_value_obj(c, rt) && comp_method_in_chain(c, ty_object_class(rt), "<=>", NULL) < 0 &&
       comp_native_method_find(c, ty_object_class(rt), "<=>", 1, 0) < 0) {
-    const char *cn = c->classes[ty_object_class(rt)].c_name;
-    if (comp_ntype(c, argv[0]) == rt) {
+    const ClassInfo *rci = &c->classes[ty_object_class(rt)];
+    const char *cn = rci->c_name;
+    /* a class whose == is not identity (its own, or a Struct's or a Data's
+       field-wise one): CRuby's rb_equal, the same object first, then == */
+    if (rci->is_struct || rci->is_data || comp_method_in_chain(c, ty_object_class(rt), "==", NULL) >= 0) {
+      int ta = ++g_tmp, tb = ++g_tmp;
+      buf_printf(b, "({ sp_RbVal _t%d = ", ta); emit_boxed(c, recv, b);
+      buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d); sp_RbVal _t%d = ", ta, tb); emit_boxed(c, argv[0], b);
+      buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d); sp_poly_rb_equal(_t%d, _t%d) ? sp_box_int(0) : sp_box_nil(); })",
+                 tb, ta, tb);
+    }
+    else if (comp_ntype(c, argv[0]) == rt) {
       int ta = ++g_tmp, tb = ++g_tmp;
       buf_printf(b, "({ sp_%s *_t%d = ", cn, ta); emit_expr(c, recv, b);
       buf_printf(b, "; sp_%s *_t%d = ", cn, tb); emit_expr(c, argv[0], b);

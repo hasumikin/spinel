@@ -299,6 +299,10 @@ void sp_poly_puts(sp_RbVal v)
       /* MRI's `puts arr` iterates an Array, printing one element per
          line (using to_s on each); a non-Array OBJ falls back to
          inspect / class-name. */
+      /* rooted for the walk: a fresh Array that only this call holds (a
+         method's answer of more than one class) is freed partway by a
+         collection an element's render runs, as sp_File_puts_val roots it */
+      SP_GC_ROOT_RBVAL(v);
       switch (v.cls_id) {
         /* an element that is nil (a gap a write past the end left, its nil
            bit) prints puts nil's empty line, as the typed puts does */
@@ -378,6 +382,24 @@ void sp_poly_puts(sp_RbVal v)
   }
 }
 
+/* Symbol#to_s and #id2name as a program calls them: a new String at each
+   call, as CRuby answers one, and frozen, as Spinel answers it (CRuby's is
+   chilled; docs/limitations.md). sp_sym_to_s_frozen is the one frozen copy
+   the runtime renders a Symbol with (puts, interpolation, inspect); two
+   calls answered that one object, so `s.to_s.equal?(s.to_s)` was true. */
+const char *sp_sym_to_s_new(sp_sym id)
+{
+  const char *nm = sp_sym_to_s_frozen(id);
+  return sp_str_freeze_val(sp_str_from_bytes(nm, sp_str_byte_len(nm)));
+}
+/* a boxed receiver's to_s as a program calls it: a Symbol's is a new
+   String (sp_sym_to_s_new), every other value's is sp_poly_to_s's */
+const char *sp_poly_to_s_call(sp_RbVal v)
+{
+  if (v.tag == SP_TAG_SYM) return sp_sym_to_s_new((sp_sym)v.v.i);
+  return sp_poly_to_s(v);
+}
+
 const char *sp_poly_to_s(sp_RbVal v)
 {
   switch (v.tag) {
@@ -427,6 +449,11 @@ const char *sp_poly_to_s(sp_RbVal v)
         case SP_BUILTIN_THREAD: return sp_Thread_inspect((sp_thread *)v.v.p);
         /* OpenStruct#to_s is its inspect, as sp_poly_inspect renders it */
         case SP_BUILTIN_OPENSTRUCT: return sp_OpenStruct_inspect((struct sp_OpenStruct_s *)v.v.p);
+        /* as the typed to_s renders each: an Enumerator and a Random by
+           their inspect, ARGF by its name; a boxed one fell through to "" */
+        case SP_BUILTIN_ENUMERATOR: return sp_enum_inspect_boxed(v);
+        case SP_BUILTIN_RANDOM: if (v.v.p) return sp_Random_inspect((sp_Random *)v.v.p); return SPL("#<Object>");
+        case SP_BUILTIN_ARGF: return SPL("ARGF");
         default:
           if ((v.cls_id >= 0 || v.cls_id == SP_BUILTIN_OBJECT) && v.v.p) {
             /* a class with a user #to_s renders through the generated
@@ -777,10 +804,10 @@ sp_StrStrHash *sp_StrPolyHash_to_s_values(sp_StrPolyHash *h)
   SP_GC_ROOT(h);
   sp_StrStrHash *r = sp_StrStrHash_new(); SP_GC_ROOT(r);
   /* a missing match reads the default, as its to_s (nil's "" is no default) */
-  if (h && h->default_v.tag != SP_TAG_NIL) r->default_v = SP_SEF(sp_poly_to_s(h->default_v));
+  if (h && h->default_v.tag != SP_TAG_NIL) r->default_v = sp_String_new_shared(sp_poly_to_s(h->default_v));
   if (h) for (sp_int i = 0; i < h->len; i++) {
     const char *k = h->order[i];
-    sp_StrStrHash_set_e(r, k, SP_SEF(sp_poly_to_s(sp_StrPolyHash_get(h, k))));
+    sp_StrStrHash_set_e(r, k, sp_String_new_shared(sp_poly_to_s(sp_StrPolyHash_get(h, k))));
   }
   return r;
 }
@@ -1306,8 +1333,8 @@ sp_PolyPolyHash *sp_poly_hash_merge(sp_RbVal a, sp_RbVal b)
   if (a.tag == SP_TAG_OBJ && a.v.p) {
     switch (a.cls_id) {
       case SP_BUILTIN_STR_INT_HASH: { sp_StrIntHash *h = (sp_StrIntHash *)a.v.p; r->default_v = h->default_nil ? sp_box_nil() : sp_box_int(h->default_v); break; }
-      case SP_BUILTIN_STR_STR_HASH: r->default_v = SP_SEBOXN(((sp_StrStrHash *)a.v.p)->default_v); break;
-      case SP_BUILTIN_INT_STR_HASH: r->default_v = SP_SEBOXN(((sp_IntStrHash *)a.v.p)->default_v); break;
+      case SP_BUILTIN_STR_STR_HASH: r->default_v = SP_SEBOX(((sp_StrStrHash *)a.v.p)->default_v); break;
+      case SP_BUILTIN_INT_STR_HASH: r->default_v = SP_SEBOX(((sp_IntStrHash *)a.v.p)->default_v); break;
       case SP_BUILTIN_INT_INT_HASH: { sp_IntIntHash *h = (sp_IntIntHash *)a.v.p; r->default_v = h->default_nil ? sp_box_nil() : sp_box_int(h->default_v); break; }
       case SP_BUILTIN_STR_POLY_HASH: r->default_v = ((sp_StrPolyHash *)a.v.p)->default_v; break;
       case SP_BUILTIN_SYM_POLY_HASH: r->default_v = ((sp_SymPolyHash *)a.v.p)->default_v; break;
@@ -1411,20 +1438,20 @@ void sp_poly_hash_writeback_ex(sp_RbVal orig, sp_PolyPolyHash *work, int with_de
     case SP_BUILTIN_STR_STR_HASH: {
       sp_StrStrHash *h = (sp_StrStrHash *)orig.v.p;
       sp_StrStrHash_clear(h);
-      if (with_default) h->default_v = SP_SEF(sp_poly_to_s_or_nil(work->default_v));
+      if (with_default) h->default_v = sp_String_new_shared(sp_poly_to_s_or_nil(work->default_v));
       for (sp_int i = 0; i < work->len; i++) {
         sp_int j = work->order[i];
-        sp_StrStrHash_set_e(h, sp_poly_to_s(work->keys[j]), SP_SEF(sp_poly_to_s_or_nil(work->vals[j])));
+        sp_StrStrHash_set_e(h, sp_poly_to_s(work->keys[j]), sp_String_new_shared(sp_poly_to_s_or_nil(work->vals[j])));
       }
       return;
     }
     case SP_BUILTIN_INT_STR_HASH: {
       sp_IntStrHash *h = (sp_IntStrHash *)orig.v.p;
       sp_IntStrHash_clear(h);
-      if (with_default) h->default_v = SP_SEF(sp_poly_to_s_or_nil(work->default_v));
+      if (with_default) h->default_v = sp_String_new_shared(sp_poly_to_s_or_nil(work->default_v));
       for (sp_int i = 0; i < work->len; i++) {
         sp_int j = work->order[i];
-        sp_IntStrHash_set_e(h, sp_poly_to_i(work->keys[j]), SP_SEF(sp_poly_to_s_or_nil(work->vals[j])));
+        sp_IntStrHash_set_e(h, sp_poly_to_i(work->keys[j]), sp_String_new_shared(sp_poly_to_s_or_nil(work->vals[j])));
       }
       return;
     }

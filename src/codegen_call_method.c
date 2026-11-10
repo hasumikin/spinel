@@ -2574,6 +2574,11 @@ static void emit_poly_callable_blk_call(Compiler *c, int t, int argc, const int 
   if (pubs) buf_puts(b, ")");
 }
 
+/* A boxed value's callable surface: a Method read out of a container
+   answers name, owner and receiver from its sp_BoundMethod; arity is a
+   Method's or a Proc's, NoMethodError naming the receiver's class for
+   any other value; call, (), yield and a bare [] call a boxed Proc or
+   Method. */
 int emit_call_poly_callable_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv) {
   /* A Method read out of a container widened to poly: answer from the
      sp_BoundMethod itself, which carries everything the compile-time arms
@@ -2619,7 +2624,7 @@ int emit_call_poly_callable_arms(Compiler *c, int id, Buf *b, const NodeTable *n
         buf_printf(b, "sp_box_sym(sp_sym_intern(((sp_BoundMethod *)_t%d.v.p)->name))"
                       " : _t%d.tag == SP_TAG_CLASS ? %s"
                       " : _t%d.tag == SP_TAG_ENCODING ? sp_box_str(sp_str_uminus_val(_t%d.v.s))"
-                      " : _t%d.tag == SP_TAG_SYM ? sp_box_str(sp_str_uminus_val(sp_sym_to_s((sp_sym)_t%d.v.i)))"
+                      " : _t%d.tag == SP_TAG_SYM ? sp_box_str(sp_sym_name_str((sp_sym)_t%d.v.i))"   /* (a Symbol's name: its one frozen String, no fstring) */
                       " : (_t%d.tag == SP_TAG_OBJ && _t%d.v.p && (_t%d.cls_id == SP_BUILTIN_EXCEPTION || sp_is_exc_subclass_cls(_t%d.cls_id)))"
                       " ? sp_exc_name_acc((sp_Exception *)_t%d.v.p)",
                    t, t, cls_arm, t, t, t, t, t, t, t, t, t);
@@ -2650,7 +2655,8 @@ int emit_call_poly_callable_arms(Compiler *c, int id, Buf *b, const NodeTable *n
   }
   /* poly_val.arity -- a Method read out of a container widened to poly. The
      arity was stamped onto the sp_BoundMethod at creation, so read it back
-     (a non-Method poly here is a genuine NoMethodError, as before) (#3231). */
+     (a non-Method poly here is a genuine NoMethodError, as before) (#3231),
+     naming the receiver's class as CRuby's does. */
   if (recv >= 0 && argc == 0 && sp_streq(name, "arity") && repr_of(c, recv).kind == RK_BOXED) {
     /* (a class method of the name too: the boxed value may be the class
        itself, `handler.arity` for sqlite3's aggregator class, which the
@@ -2668,8 +2674,8 @@ int emit_call_poly_callable_arms(Compiler *c, int id, Buf *b, const NodeTable *n
       buf_printf(b, "({ sp_RbVal _t%d = ", t); emit_expr(c, recv, b);
       buf_printf(b, "; _t%d.cls_id == SP_BUILTIN_METHOD ? ((sp_BoundMethod *)_t%d.v.p)->arity"
                     " : _t%d.cls_id == SP_BUILTIN_PROC ? sp_proc_arity((sp_Proc *)_t%d.v.p)"
-                    " : (sp_raise_cls(\"NoMethodError\", (&(\"\\xff\" \"undefined method 'arity'\")[1])), (sp_int)0); })",
-                 t, t, t, t);
+                    " : (sp_raise_nomethod(sp_nomethod_msg(\"arity\", _t%d)), (sp_int)0); })",
+                 t, t, t, t, t);
       if (boxed) buf_puts(b, ")");
       return 1;
     }
@@ -3054,7 +3060,9 @@ int emit_send_blind(Compiler *c, int id, Buf *b) {
            class name reads */
         { Buf lb; memset(&lb, 0, sizeof lb);
           const char *snm = nt_str(c->nt, id, "name");
-          int nl = builtin_classes_below_object_list(snm, &lb);
+          int nl = 0, ri = 0;
+          for (const char *bn; (bn = builtin_next_class_answering(&ri, snm)); )
+            buf_printf(&lb, "%s\"%s\"", nl++ ? ", " : "(const char *const[]){", bn);
           for (int k = 0; k < c->nclasses; k++) {
             const char *rn = class_ruby_name(c, k);
             if (rn && !comp_class_is_module(c, &c->classes[k]) &&

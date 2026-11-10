@@ -270,6 +270,10 @@ int emit_ctor_yield_inline(Compiler *c, int id, int ci, Buf *b) {
   }
 
   int tag = ++g_tmp;
+  /* the call's arguments are the caller's code: `Set.new(yield)` yields to the
+     caller's block, whatever block the spliced initialize runs under */
+  InlineBlockCtx caller_bc;
+  inline_block_ctx_save(&caller_bc);
   int saved_nren = g_nren, saved_block = g_block_id;
   int saved_bnren = g_block_nren, saved_yfbn = g_yield_block_fallback_nren;
   const char *saved_self = g_self;
@@ -311,6 +315,9 @@ int emit_ctor_yield_inline(Compiler *c, int id, int ci, Buf *b) {
   /* a literal block's `return` leaves the method it is written in, which
      may itself be spliced into its caller (its `_yretN` funnel) */
   BlockRetHome saved_brh = block_ret_home_enter(g_block_id, saved_block);
+  InlineBlockCtx callee_bc;
+  inline_block_ctx_save(&callee_bc);
+  inline_block_ctx_restore(&caller_bc);
 
   int st = ++g_tmp;
   buf_puts(b, "({\n");
@@ -495,8 +502,17 @@ int emit_ctor_yield_inline(Compiler *c, int id, int ci, Buf *b) {
     }
     else if (L.from[i] == ARG_REST)
       emit_rest_pack_kwh(c, i, L.rest_argc - m->npost_rest, argv2, L.rest_kwh, b);
-    else if (provided < 0 && ds_tmp >= 0 && callee_has_kwarg(c, m, m->pnames[i]))
+    else if (provided < 0 && ds_tmp >= 0 && callee_has_kwarg(c, m, m->pnames[i])) {
+      inline_block_ctx_restore(&callee_bc);   /* may evaluate the keyword's default */
       emit_ds_param_extract(c, m, i, ds_tmp, ds_type, b);
+      inline_block_ctx_restore(&caller_bc);
+    }
+    else if (provided < 0) {
+      /* a default is the callee's own code, with its own block */
+      inline_block_ctx_restore(&callee_bc);
+      emit_arg_or_default(c, m, i, provided, b);
+      inline_block_ctx_restore(&caller_bc);
+    }
     else emit_arg_or_default(c, m, i, provided, b);
     g_self = svs; g_self_deref = svd;
     ren_unpark(&park);
@@ -505,6 +521,8 @@ int emit_ctor_yield_inline(Compiler *c, int id, int ci, Buf *b) {
   inl_dflt_leave(sv_dflt);
   view_unbind(argov_saved);
   arg_layout_free(&L);
+  /* the call-site code is bound: the body runs under the callee's block context */
+  inline_block_ctx_restore(&callee_bc);
 
   /* The inlined `initialize` body runs in the CONSTRUCTED class's context:
      an implicit-self call inside it (`setup` in `def initialize; setup;
@@ -1341,6 +1359,8 @@ const int *comp_exc_subclasses(Compiler *c, int *n) {
 static int class_is_prim_reopen_raw(Compiler *c, int k) {
   const char *n = c->classes[k].name;
   return sp_streq(n, "Integer") || sp_streq(n, "Float") ||
+         /* every Integer and Float is a Numeric's instance */
+         sp_streq(n, "Numeric") ||
          sp_streq(n, "String") || sp_streq(n, "Symbol") ||
          sp_streq(n, "NilClass") ||
          sp_streq(n, "TrueClass") || sp_streq(n, "FalseClass") ||
@@ -1740,8 +1760,15 @@ static void emit_poly_dispatch_key_pick(Compiler *c, int tv, int key_guard, int 
       if (si >= 0) { opened++; buf_printf(b, "((_t%d.tag == SP_TAG_OBJ && _t%d.cls_id == SP_BUILTIN_STRBUF) ? %d : ", tv, tv, si); } }
   }
   buf_printf(b, "(_t%d.tag == SP_TAG_OBJ ? _t%d.cls_id", tv, tv);
+  /* an Integer or Float whose own reopening (if any) lacks the name takes
+     the Numeric reopening's arm */
+  int nmi = comp_class_index(c, "Numeric");
+  if (nmi >= 0 && !(class_is_prim_reopen(c, nmi) &&
+                    (!pick_name || comp_method_in_chain(c, nmi, pick_name, NULL) >= 0))) nmi = -1;
   for (unsigned i = 0; i < sizeof P / sizeof P[0]; i++) {
     int idx = comp_core_class(c, P[i].cls);
+    if (nmi >= 0 && (P[i].cls == CORE_INTEGER || P[i].cls == CORE_FLOAT) &&
+        (idx < 0 || (pick_name && comp_method_in_chain(c, idx, pick_name, NULL) < 0))) idx = nmi;
     if (idx >= 0) buf_printf(b, " : _t%d.tag == %s ? %d", tv, P[i].tag, idx);
   }
   { int ti = comp_core_class(c, CORE_TRUECLASS), fi = comp_core_class(c, CORE_FALSECLASS);
@@ -1851,10 +1878,24 @@ static int kwh_elem_named(Compiler *c, int kwn, const int *kwels, const char *pn
 int emit_reopen_arm_test(Compiler *c, int kmi, const char *name, const char *cls,
                                 const char *raise, Buf *b) {
   if (kmi != class_reopen_cmethod(c, -1, -1, name)) return 0;
-  char t[200];
-  snprintf(t, sizeof t, "(%s).cls_id < 0 && !sp_class_nil_p(%s) && !sp_class_is_module_val(%s)", cls, cls, cls);
-  if (raise) buf_printf(b, " default: if (!(%s)) { %s; break; } ", t, raise);
-  else buf_printf(b, "(%s) ? ", t);
+  /* a core class, or a program's class whose own class methods (its chain's)
+     do not define the name otherwise: a class value self in an included
+     method (`try` on `A`), which no arm of A's own reaches, answers by the
+     reopening as CRuby does. A copy of the reopening's method in the class
+     (same def) is the same method. */
+  Buf t; memset(&t, 0, sizeof t);
+  buf_printf(&t, "!sp_class_nil_p(%s) && !sp_class_is_module_val(%s) && ((%s).cls_id < 0 || ((%s).cls_id != SP_CLASS_BY_NAME", cls, cls, cls, cls);
+  int rc = comp_core_class(c, CORE_CLASS_REOPEN), kdef = c->scopes[kmi].def_node;
+  for (int k = 0; k < c->nclasses; k++) {
+    if (k == rc || comp_class_is_module(c, &c->classes[k])) continue;
+    int own = comp_cmethod_in_chain(c, k, name, NULL);
+    if (own >= 0 && own != kmi && c->scopes[own].def_node != kdef)
+      buf_printf(&t, " && (%s).cls_id != %d", cls, k);
+  }
+  buf_puts(&t, "))");
+  if (raise) buf_printf(b, " default: if (!(%s)) { %s; break; } ", t.p, raise);
+  else buf_printf(b, "(%s) ? ", t.p);
+  free(t.p);
   return 1;
 }
 /* Class-only targets need this dispatch when the name also has builtin
@@ -2482,40 +2523,6 @@ int builtin_instance_method_known(const char *cls, const char *m) {
 int builtin_instance_name_known(const char *m) {
   for (int i = 0; sp_builtin_names_tbl[i].cls; i++)
     if (sp_streq(sp_builtin_names_tbl[i].m, m)) return 1;
-  return 0;
-}
-/* the classes below Object that answer m, as the head of a C list literal
-   of their names, into out (the caller adds more and ends it); their count */
-int builtin_classes_below_object_list(const char *m, Buf *out) {
-  int n = 0;
-  for (int i = 0; m && sp_builtin_names_tbl[i].cls; i++) {
-    const char *k = sp_builtin_names_tbl[i].cls;
-    if (!sp_streq(sp_builtin_names_tbl[i].m, m) || sp_streq(k, "Object") || sp_streq(k, "Kernel") ||
-        sp_streq(k, "BasicObject")) continue;
-    int seen = 0;
-    for (int j = 0; j < i && !seen; j++)
-      seen = sp_streq(sp_builtin_names_tbl[j].cls, k) && sp_streq(sp_builtin_names_tbl[j].m, m);
-    if (seen) continue;
-    buf_printf(out, "%s\"%s\"", n++ ? ", " : "(const char *const[]){", k);
-  }
-  return n;
-}
-/* does the builtin class with run-time id `id` (-105 for Hash), or a builtin
-   class above it and below Object, answer m? A program's class under it
-   (`class MyH < Hash`) answers m by that method before a top-level def */
-int builtin_id_below_object_answers(int id, const char *m) {
-  for (int depth = 0; id && m && depth < 16; depth++) {
-    const BuiltinClass *r = NULL;
-    for (int i = 0; (r = builtin_class_at(i)) && r->id != id; i++) {}
-    if (!r || sp_streq(r->name, "Object") || sp_streq(r->name, "BasicObject")) return 0;
-    const char *nm[2] = { r->name, (r->flags & BC_EXCEPTION) ? "Exception" : NULL };
-    for (int j = 0; j < 2; j++)
-      for (int i = 0; nm[j] && sp_builtin_names_tbl[i].cls; i++)
-        if (sp_streq(sp_builtin_names_tbl[i].cls, nm[j]) && sp_streq(sp_builtin_names_tbl[i].m, m)) return 1;
-    int p = builtin_class_parent_id(id);
-    if (p == id) break;
-    id = p;
-  }
   return 0;
 }
 /* does a builtin class below Object (Integer, String, Array, ...) answer m?
@@ -6616,35 +6623,52 @@ int obj_cmp_by_identity(TyKind t) {
 /* Can a `next v` of this block body (not one of a nested block, lambda,
    def or loop, which `next` leaves instead) hand the slot a nil: a bare
    `next`, `next nil`, or a value that can be nil. A `break` where jk asks
-   for one: it leaves the call the block was given to, with its value. */
-static int block_jump_may_be_nil(Compiler *c, int id, int depth, NodeKind jk) {
+   for one: it leaves the call the block was given to, with its value. The
+   walk keeps its own stack, so a body nested to any depth costs one visit
+   per node. */
+static int block_jump_may_be_nil(Compiler *c, int root, NodeKind jk) {
   const NodeTable *nt = c->nt;
-  if (id < 0 || depth > 200) return 0;
-  NodeKind k = nt_kind(nt, id);
-  if (k == jk) {
-    int a = nt_ref(nt, id, "arguments"), an = 0;
-    const int *av = a >= 0 ? nt_arr(nt, a, "arguments", &an) : NULL;
-    if (an == 0) return 1;
-    return an == 1 && node_may_be_nil(c, av[0]);
-  }
-  if (k == NK_DefNode || k == NK_ClassNode || k == NK_ModuleNode || k == NK_WhileNode ||
-      k == NK_UntilNode || k == NK_LambdaNode || k == NK_ForNode) return 0;
-  if (k == NK_CallNode && nt_ref(nt, id, "block") >= 0 && nt_kind(nt, nt_ref(nt, id, "block")) == NK_BlockNode) {
+  int local[64], *st = local, cap = 64, n = 0, found = 0;
+  st[n++] = root;
+  while (n > 0 && !found) {
+    int id = st[--n];
+    if (id < 0) continue;
+    NodeKind k = nt_kind(nt, id);
+    if (k == jk) {
+      int a = nt_ref(nt, id, "arguments"), an = 0;
+      const int *av = a >= 0 ? nt_arr(nt, a, "arguments", &an) : NULL;
+      found = an == 0 || (an == 1 && node_may_be_nil(c, av[0]));
+      continue;
+    }
+    if (k == NK_DefNode || k == NK_ClassNode || k == NK_ModuleNode || k == NK_WhileNode ||
+        k == NK_UntilNode || k == NK_LambdaNode || k == NK_ForNode) continue;
     /* a nested block's `next` is its own; its receiver and arguments are this body's */
-    return block_jump_may_be_nil(c, nt_ref(nt, id, "receiver"), depth + 1, jk) ||
-           block_jump_may_be_nil(c, nt_ref(nt, id, "arguments"), depth + 1, jk);
+    int own_block = k == NK_CallNode && nt_ref(nt, id, "block") >= 0 && nt_kind(nt, nt_ref(nt, id, "block")) == NK_BlockNode;
+    int nr = nt_num_refs(nt, id), na = nt_num_arrs(nt, id), kids = nr;
+    for (int i = 0; i < na; i++) { int m = 0; nt_arr_at(nt, id, i, &m); kids += m; }
+    if (n + kids > cap) {
+      while (n + kids > cap) cap *= 2;
+      int *g = (int *)(st == local ? malloc(sizeof(int) * (size_t)cap) : realloc(st, sizeof(int) * (size_t)cap));
+      if (!g) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+      if (st == local) memcpy(g, local, sizeof(int) * (size_t)n);
+      st = g;
+    }
+    if (own_block) {
+      st[n++] = nt_ref(nt, id, "receiver");
+      st[n++] = nt_ref(nt, id, "arguments");
+      continue;
+    }
+    for (int i = 0; i < nr; i++) st[n++] = nt_ref_at(nt, id, i);
+    for (int i = 0; i < na; i++) {
+      int m = 0; const int *ids = nt_arr_at(nt, id, i, &m);
+      for (int j = 0; j < m; j++) st[n++] = ids[j];
+    }
   }
-  int nr = nt_num_refs(nt, id);
-  for (int i = 0; i < nr; i++) if (block_jump_may_be_nil(c, nt_ref_at(nt, id, i), depth + 1, jk)) return 1;
-  int na = nt_num_arrs(nt, id);
-  for (int i = 0; i < na; i++) {
-    int n = 0; const int *ids = nt_arr_at(nt, id, i, &n);
-    for (int j = 0; j < n; j++) if (block_jump_may_be_nil(c, ids[j], depth + 1, jk)) return 1;
-  }
-  return 0;
+  if (st != local) free(st);
+  return found;
 }
-int block_next_may_be_nil(Compiler *c, int id, int depth) { return block_jump_may_be_nil(c, id, depth, NK_NextNode); }
-int block_break_may_be_nil(Compiler *c, int id, int depth) { return block_jump_may_be_nil(c, id, depth, NK_BreakNode); }
+int block_next_may_be_nil(Compiler *c, int id) { return block_jump_may_be_nil(c, id, NK_NextNode); }
+int block_break_may_be_nil(Compiler *c, int id) { return block_jump_may_be_nil(c, id, NK_BreakNode); }
 
 /* Does the program define `<=>` on Object itself? Every class that has none of
    its own then answers it. */
@@ -6782,13 +6806,13 @@ int emit_poly_pred_value(Compiler *c, int id, const char *tvref,
   if (is_isa || is_iof) {
     int arg = argv[0];
     char qbuf[192];
-    const char *cn = isa_match_class_name(c, arg, qbuf, sizeof qbuf);
+    int target;   /* a user class in this program? */
+    const char *cn = isa_match_class(c, arg, qbuf, sizeof qbuf, &target);
     if (cn) {
       if (is_iof) {   /* exact class match by name (builtin or user class) */
         buf_printf(b, "(strcmp(sp_poly_class_name(%s), \"%s\") == 0)", tvref, cn);
         return 1;
       }
-      int target = comp_class_index(c, cn);   /* a user class in this program? */
       /* a program module may be mixed into a builtin by reopening it, so a
          builtin value answers it too: the ancestor walk, which reads those */
       if (target >= 0 && comp_class_is_module(c, &c->classes[target])) {
@@ -8690,6 +8714,28 @@ static int arm_raises_nomethod_for(const char *text, const char *name) {
    bound to _t<tv> (emit_poly_builtin_default_at): the arm's text into nb,
    what it hoists into *arm_pre. 0 when the probe declined. */
 static int poly_default_obj_spreads(Compiler *c, int id, const char *name);
+/* Array#at, kept by name where a program class owns it (desugar_array_at:
+   an instance method `at`, or a class method `at` a boxed receiver may be a
+   Class of): for a receiver that is no Class, the index read that checks
+   its receiver is an Array (an index, never a Range, as the rewrite takes
+   it). Renames call id so for the emission between this and
+   at_kept_by_name_restore; answers 0 and changes nothing where the call is
+   not such an `at`. */
+static int at_kept_by_name_swap(Compiler *c, int id, const char *name, int argc, const int *argv, char **sv_nm) {
+  const NodeTable *nt = c->nt;
+  TyKind at_ty = argc == 1 ? comp_ntype(c, argv[0]) : TY_UNKNOWN;
+  if (!name || !sp_streq(name, "at") || argc != 1 || nt_kind(nt, argv[0]) == NK_SplatNode ||
+      nt_ref(nt, id, "block") >= 0 || nt_int(nt, id, "was_at", 0) ||
+      at_ty == TY_RANGE || at_ty == TY_FLOAT_RANGE || at_ty == TY_STR_RANGE) return 0;
+  *sv_nm = nt_node_swap_str((NodeTable *)nt, id, "name", "[]");
+  nt_node_set_int((NodeTable *)nt, id, "was_at", 1);
+  return 1;
+}
+static void at_kept_by_name_restore(Compiler *c, int id, char *sv_nm) {
+  nt_node_restore_str((NodeTable *)c->nt, id, "name", sv_nm);
+  nt_node_set_int((NodeTable *)c->nt, id, "was_at", 0);
+}
+
 /* The index of call id's last splat argument, or -1 */
 static int poly_last_splat(const NodeTable *nt, int argc, const int *argv) {
   int last = -1;
@@ -8754,18 +8800,12 @@ static int bi_default_probe(Compiler *c, int id, int recv, const char *name, int
   int dblk = nt_ref(nt, id, "block");
   int drop_blk = dblk >= 0 && nt_kind(nt, dblk) == NK_BlockArgumentNode && (builtin_read_ignores_block(name) || nil_fwd);
   if (drop_blk) nt_node_set_ref((NodeTable *)nt, id, "block", -1);
-  /* Array#at, kept by name where a program class owns it (desugar_array_at),
-     is the index read that checks its receiver is an Array (an index, never
-     a Range, as the rewrite takes it) */
-  TyKind at_ty = argc == 1 ? comp_ntype(c, argv[0]) : TY_UNKNOWN;
-  int as_at = sp_streq(name, "at") && argc == 1 && nt_kind(nt, argv[0]) != NK_SplatNode &&
-              nt_ref(nt, id, "block") < 0 && !nt_int(nt, id, "was_at", 0) &&
-              at_ty != TY_RANGE && at_ty != TY_FLOAT_RANGE && at_ty != TY_STR_RANGE;
+  /* Array#at, kept by name where a program class owns it */
   char *sv_nm = NULL;
-  if (as_at) { sv_nm = nt_node_swap_str((NodeTable *)nt, id, "name", "[]"); nt_node_set_int((NodeTable *)nt, id, "was_at", 1); }
+  int as_at = at_kept_by_name_swap(c, id, name, argc, argv, &sv_nm);
   int ok = poly_arm_probe(c, id, builtin_default_probe_fn, &pr, nb, arm_pre);
   if (drop_blk) nt_node_set_ref((NodeTable *)nt, id, "block", dblk);
-  if (as_at) { nt_node_restore_str((NodeTable *)nt, id, "name", sv_nm); nt_node_set_int((NodeTable *)nt, id, "was_at", 0); }
+  if (as_at) at_kept_by_name_restore(c, id, sv_nm);
   *box_o = pr.box_o;
   view_pop(c, vw);
   view_pop(c, va);
@@ -10084,8 +10124,7 @@ static int emit_poly_shared_arg(Compiler *c, const PolyArgs *A, int k, Buf *pa) 
     free(sref.p);
     return 1;
   }
-  if (at == TY_STRBUF) buf_printf(pa, "_t%d", A->atmp[k]);
-  else buf_printf(pa, "sp_String_new_shared(_t%d)", A->atmp[k]);
+  buf_printf(pa, "sp_String_new_shared(_t%d)", A->atmp[k]);
   return 1;
 }
 
@@ -10280,21 +10319,15 @@ void emit_poly_arm_args(Compiler *c, Scope *m, Scope *ms, const ArgLayout *L,
       LocalVar *pv = scope_local(ms, pnm);
       TyKind pt = pv ? pv->type : TY_POLY;
       if (pt == TY_UNKNOWN) pt = TY_POLY;
-      if (pv && pv->byref_out) {
-        buf_printf(pre, "%s *_cell__pd%d_%d = %s; ", borrowed_string_type(pv), pd_uid, a, pa.p ? pa.p : "NULL");
-        buf_printf(cb, "_cell__pd%d_%d", pd_uid, a);
-      }
-      else {
-        /* the parameter's own slot type (an oint slot included) */
-        if (pv && pv->type != TY_UNKNOWN) emit_slot_ctype(c, pv, pre); else emit_ctype(c, pt, pre);
-        buf_printf(pre, " lv__pd%d_%d = %s; ", pd_uid, a, pa.p ? pa.p : default_value_from_compiler(c, pt));
-        if (needs_root(pt))
-          buf_printf(pre, pt == TY_POLY ? "SP_GC_ROOT_RBVAL(lv__pd%d_%d); " : "SP_GC_ROOT(lv__pd%d_%d); ", pd_uid, a);
-        buf_printf(cb, "lv__pd%d_%d", pd_uid, a);
-        /* a captured parameter is read by a later default through its cell */
-        char pdn[48]; snprintf(pdn, sizeof pdn, "_pd%d_%d", pd_uid, a);
-        emit_pd_cell_alias_into(c, pv, pdn, pre, 0);
-      }
+      /* the parameter's own slot type (an oint slot included) */
+      if (pv && pv->type != TY_UNKNOWN) emit_slot_ctype(c, pv, pre); else emit_ctype(c, pt, pre);
+      buf_printf(pre, " lv__pd%d_%d = %s; ", pd_uid, a, pa.p ? pa.p : default_value_from_compiler(c, pt));
+      if (needs_root(pt))
+        buf_printf(pre, pt == TY_POLY ? "SP_GC_ROOT_RBVAL(lv__pd%d_%d); " : "SP_GC_ROOT(lv__pd%d_%d); ", pd_uid, a);
+      buf_printf(cb, "lv__pd%d_%d", pd_uid, a);
+      /* a captured parameter is read by a later default through its cell */
+      char pdn[48]; snprintf(pdn, sizeof pdn, "_pd%d_%d", pd_uid, a);
+      emit_pd_cell_alias_into(c, pv, pdn, pre, 0);
       /* registered AFTER the binding so only a LATER default reads it */
       ren_push(pnm, "_pd%d_%d", pd_uid, a);
     }
@@ -12284,7 +12317,7 @@ void ctor_arm_arg(Compiler *c, Scope *is, int j, const char *val, int pd_uid,
                          Buf *pdpre, Buf *args) {
   const char *pn = is && is->pnames ? is->pnames[j] : NULL;
   LocalVar *pv = pn ? scope_local(is, pn) : NULL;
-  if (!pd_uid || !pn || (pv && pv->byref_out) || g_nren >= MAX_RENAME) {
+  if (!pd_uid || !pn || g_nren >= MAX_RENAME) {
     buf_puts(args, val);
     return;
   }
@@ -16034,7 +16067,7 @@ static int emit_new_call_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
       /* an Integer or Float tail that can be nil is pushed with its nil: the
          slot (and the `next` slot) is its oint */
       int tail_o = bn > 0 && bb && (sp_streq(k, "Int") || sp_streq(k, "Float")) &&
-                   (nil_store_sfx(c, k, bb[bn - 1])[0] || (an_next && block_next_may_be_nil(c, bbody, 0)));
+                   (nil_store_sfx(c, k, bb[bn - 1])[0] || (an_next && block_next_may_be_nil(c, bbody)));
       if (an_next) {
         anv = ++g_tmp;
         snprintf(anbuf, sizeof anbuf, "_t%d", anv);
@@ -19867,23 +19900,23 @@ void emit_responds_name(Compiler *c, int k, const char *nm, Buf *pub, Buf *priv)
 /* The Class/Module surface every class object carries, `new` included (a
    MODULE object answers everything here except `new`, which its callers gate).
    One list, so a core class object and a user one answer alike (#3494). */
+/* Class's public instance methods beyond Object's, from ruby 4.0.1 */
+static const char *const cls_uni[] = {
+  "new", "allocate", "attached_object", "subclasses", "superclass",
+  "<", "<=", ">", ">=", "alias_method", "ancestors", "attr", "attr_accessor",
+  "attr_reader", "attr_writer", "autoload", "autoload?", "class_eval", "class_exec",
+  "class_variable_defined?", "class_variable_get", "class_variable_set",
+  "class_variables", "const_defined?", "const_get", "const_missing", "const_set",
+  "const_source_location", "constants", "define_method", "deprecate_constant",
+  "include", "include?", "included_modules", "instance_method", "instance_methods",
+  "method_defined?", "module_eval", "module_exec", "name", "prepend",
+  "private_class_method", "private_constant", "private_instance_methods",
+  "private_method_defined?", "protected_instance_methods", "protected_method_defined?",
+  "public_class_method", "public_constant", "public_instance_method",
+  "public_instance_methods", "public_method_defined?", "refinements",
+  "remove_class_variable", "remove_method", "set_temporary_name", "singleton_class?",
+  "undef_method", "undefined_instance_methods", NULL };
 static int class_object_universal_method(const char *qm) {
-  /* Class's public instance methods beyond Object's, from ruby 4.0.1 */
-  static const char *const cls_uni[] = {
-    "new", "allocate", "attached_object", "subclasses", "superclass",
-    "<", "<=", ">", ">=", "alias_method", "ancestors", "attr", "attr_accessor",
-    "attr_reader", "attr_writer", "autoload", "autoload?", "class_eval", "class_exec",
-    "class_variable_defined?", "class_variable_get", "class_variable_set",
-    "class_variables", "const_defined?", "const_get", "const_missing", "const_set",
-    "const_source_location", "constants", "define_method", "deprecate_constant",
-    "include", "include?", "included_modules", "instance_method", "instance_methods",
-    "method_defined?", "module_eval", "module_exec", "name", "prepend",
-    "private_class_method", "private_constant", "private_instance_methods",
-    "private_method_defined?", "protected_instance_methods", "protected_method_defined?",
-    "public_class_method", "public_constant", "public_instance_method",
-    "public_instance_methods", "public_method_defined?", "refinements",
-    "remove_class_variable", "remove_method", "set_temporary_name", "singleton_class?",
-    "undef_method", "undefined_instance_methods", NULL };
   for (int u = 0; cls_uni[u]; u++) if (sp_streq(qm, cls_uni[u])) return 1;
   return 0;
 }
@@ -19982,6 +20015,95 @@ int class_value_responds(Compiler *c, int tv, const char *qm, Buf *b) {
   for (int k = 0; k < c->nclasses; k++) if (class_responds_to(c, k, qm, -1)) buf_printf(b, " || _t%d.cls_id == %d", tv, k);
   buf_puts(b, ")))");
   return 1;
+}
+
+/* The same for a name known only at run time: a class value answers the
+   Class/Module surface, the methods a `class Class` reopening gives every
+   class, and its own class methods, by its class. One function, written
+   with its prototype when the finished program calls it (as pd_emit_used
+   writes its helpers): its lists name every class's class methods, too
+   many to repeat at each site. */
+static void class_value_name_once(Buf *b, Buf *seen, const char *nm) {
+  /* seen holds "\0name\0" entries to keep each list free of repeats */
+  size_t n = strlen(nm);
+  for (size_t i = 0; seen->p && i < seen->len; i += strlen(seen->p + i) + 1)
+    if (strlen(seen->p + i) == n && !memcmp(seen->p + i, nm, n)) return;
+  buf_putn(seen, nm, n + 1);
+  buf_puts(b, "\""); emit_c_escaped(b, nm); buf_puts(b, "\", ");
+}
+void class_value_responds_runtime(int tv, Buf *b) {
+  buf_printf(b, " || sp_class_value_responds(_t%d, _n%d)", tv, tv);
+}
+void emit_class_value_responds_helper(Compiler *c, const char *const *texts, int ntexts, Buf *protos, Buf *defs) {
+  int any = 0;
+  for (int t = 0; t < ntexts && !any; t++) any = texts[t] && strstr(texts[t], "sp_class_value_responds(") != NULL;
+  if (!any) return;
+  buf_puts(protos, "static sp_bool sp_class_value_responds(sp_RbVal v, const char *n);\n");
+  Buf *b = defs;
+  Buf uni, cls_only, reopen;
+  memset(&uni, 0, sizeof uni); memset(&cls_only, 0, sizeof cls_only); memset(&reopen, 0, sizeof reopen);
+  /* the Class/Module surface, split by what a module object lacks */
+  for (int u = 0; cls_uni[u]; u++) {
+    buf_puts(class_only_method(cls_uni[u]) ? &cls_only : &uni, "\"");
+    emit_c_escaped(class_only_method(cls_uni[u]) ? &cls_only : &uni, cls_uni[u]);
+    buf_puts(class_only_method(cls_uni[u]) ? &cls_only : &uni, "\", ");
+  }
+  /* a `class Class` reopening's methods, every class's */
+  Buf seen;
+  memset(&seen, 0, sizeof seen);
+  for (int s = 0; s < c->nscopes; s++) {
+    const Scope *sc = &c->scopes[s];
+    if (sc->name && sc->is_cmethod && !sc->is_proc_form && !name_is_synth_method(c, sc->name) &&
+        class_reopen_cmethod(c, -1, -1, sc->name) == s)
+      class_value_name_once(&reopen, &seen, sc->name);
+  }
+  free(seen.p);
+  buf_printf(b, "static sp_bool sp_class_value_responds(sp_RbVal v, const char *n) {\n  if (v.tag != SP_TAG_CLASS) return 0;\n  if (sp_str_in_list(n, (const char *const[]){%sNULL})) return 1;\n  sp_bool r = 0;\n  switch (v.cls_id) {", uni.p ? uni.p : "");
+  /* the class methods of the program, asked of each class's chain */
+  int ncm = 0, *cms = malloc(sizeof(int) * (size_t)(c->nscopes > 0 ? c->nscopes : 1));
+  for (int s = 0; s < c->nscopes; s++) {
+    const Scope *sc = &c->scopes[s];
+    /* (one the program compiles: an uncompiled one no dispatch arm calls) */
+    if (sc->name && sc->is_cmethod && sc->reachable && !sc->is_proc_form && !name_is_synth_method(c, sc->name)) cms[ncm++] = s;
+  }
+  for (int k = 0; k < c->nclasses; k++) {
+    if (k == comp_core_class(c, CORE_CLASS_REOPEN)) continue;
+    int is_module = comp_class_is_module(c, &c->classes[k]);
+    Buf nb;
+    memset(&nb, 0, sizeof nb);
+    memset(&seen, 0, sizeof seen);
+    for (int i = 0; i < ncm; i++)
+      if (comp_cmethod_in_chain(c, k, c->scopes[cms[i]].name, NULL) == cms[i])
+        class_value_name_once(&nb, &seen, c->scopes[cms[i]].name);
+    for (int p = k; p >= 0; p = c->classes[p].parent) {
+      ClassInfo *ci = &c->classes[p];
+      for (int r = 0; r < ci->nsg_readers; r++) class_value_name_once(&nb, &seen, ci->sg_readers[r]);
+      for (int w = 0; w < ci->nsg_writers; w++) {
+        char wn[260];
+        if (snprintf(wn, sizeof wn, "%s=", ci->sg_writers[w]) < (int)sizeof wn) class_value_name_once(&nb, &seen, wn);
+      }
+    }
+    free(seen.p);
+    /* a class with no names of its own answers by the default's; a module
+       answers neither Class's own methods nor the reopening's */
+    if (!nb.len && !is_module) continue;
+    buf_printf(b, " case %d: r = ", k);
+    if (nb.len) buf_printf(b, "sp_str_in_list(n, (const char *const[]){%sNULL}) || ", nb.p);
+    if (!is_module) {
+      if (cls_only.len) buf_printf(b, "sp_str_in_list(n, (const char *const[]){%sNULL}) || ", cls_only.p);
+      if (reopen.len) buf_printf(b, "sp_str_in_list(n, (const char *const[]){%sNULL}) || ", reopen.p);
+    }
+    buf_puts(b, "0; break;");
+    free(nb.p);
+  }
+  /* a core class value (or one named at run time): Class's whole surface
+     and the reopening's methods */
+  buf_puts(b, " default: r = ");
+  if (cls_only.len) buf_printf(b, "sp_str_in_list(n, (const char *const[]){%sNULL}) || ", cls_only.p);
+  if (reopen.len) buf_printf(b, "sp_str_in_list(n, (const char *const[]){%sNULL}) || ", reopen.p);
+  buf_puts(b, "0; break; }\n  return r;\n}\n");
+  free(cms);
+  free(uni.p); free(cls_only.p); free(reopen.p);
 }
 
 /* Append the trailing `&block` argument (an sp_Proc *, or NULL) to a direct
@@ -20944,6 +21066,13 @@ static int arity_call_block(const NodeTable *nt, int id, int *argc, int *kwh) {
 /* The guard's decision: a builtin call whose positional count CRuby rejects.
    exp receives CRuby's wording of the accepted range, eval_recv whether the
    receiver is an expression to evaluate before the raise. */
+/* Does constant read `recv` hold a builtin value -- an Array, a Hash, a
+   String, a number -- rather than a class or module? */
+static int const_reads_builtin_value(Compiler *c, int recv) {
+  TyKind rt = comp_ntype(c, recv);
+  return ty_is_array(rt) || ty_is_hash(rt) || rt == TY_STRING || rt == TY_STRBUF ||
+         rt == TY_INT || rt == TY_FLOAT || rt == TY_SYMBOL;
+}
 static int arity_violation(Compiler *c, int id, char *exp, size_t n, int *eval_recv) {
   const NodeTable *nt = c->nt;
   const char *name = nt_str(nt, id, "name");
@@ -20956,6 +21085,9 @@ static int arity_violation(Compiler *c, int id, char *exp, size_t n, int *eval_r
   const SpAritySpec *itbl = sp_builtin_arity_spec_tbl;
   const SpAritySpec *ctbl = sp_builtin_cmeth_arity_spec_tbl;
   NodeKind rty2_k = nt_kind(nt, recv);
+  /* a constant that holds a value (`C = [1]; C.<<(2, 3)`) is checked by
+     its value's class below, not as a class object */
+  if (rty2_k == NK_ConstantReadNode && const_reads_builtin_value(c, recv)) rty2_k = NK_CallNode;
   if (kwh && (recv < 0 || (rty2_k == NK_ConstantReadNode))) return 0;
   if (recv < 0) {
     /* A bare call resolves to the enclosing class's chain, then to a
@@ -21656,9 +21788,19 @@ static int emit_bivar_copy_wrap(Compiler *c, int id, Buf *b) {
   snprintf(rn, sizeof rn, "_t%d", t); snprintf(dn, sizeof dn, "_d%d", t);
   buf_puts(b, "({ "); emit_ctype(c, rr.kind == RK_BOXED ? TY_POLY : rt, b); buf_printf(b, " %s = ", rn); emit_expr(c, recv, b);
   buf_printf(b, rr.kind == RK_BOXED ? "; SP_GC_ROOT_RBVAL(%s); " : "; SP_GC_ROOT(%s); ", rn);
+  /* The ivar receiver's nil test reads the hold, inside the expression: the
+     call's own guard, under the view below, names `_tN` too, and when an
+     argument hoists its work into g_pre (`@h.merge(k => v)`'s Hash) it
+     went ahead of the statement, before `_tN` was declared. */
+  int sv_ng = g_ivar_nil_guarded_id;
+  if (rr.kind != RK_BOXED && emit_held_nil_guard(c, id, t, b)) {
+    buf_puts(b, " ");
+    g_ivar_nil_guarded_id = id;
+  }
   int slot = view_bind(recv, "%s", rn);
   emit_ctype(c, ret, b); buf_printf(b, " %s = ", dn); emit_call_unwrapped(c, id, b);
   view_unbind(slot);
+  g_ivar_nil_guarded_id = sv_ng;
   buf_printf(b, ret_repr.kind == RK_BOXED ? "; SP_GC_ROOT_RBVAL(%s); sp_bivar_copy(" : "; SP_GC_ROOT(%s); sp_bivar_copy(", dn);
   emit_boxed_text(c, rr.kind == RK_BOXED ? TY_POLY : rt, rn, b); buf_puts(b, ", "); emit_boxed_text(c, ret, dn, b);
   buf_printf(b, "); %s; })", dn);
@@ -22815,10 +22957,26 @@ static int class_value_builtin_answers(Compiler *c, const char *vnm, int is_clas
   }
   return 1;
 }
+/* Is m a reopened Class or Module, or does one include or prepend module
+   m (also through another module)? A module value (only_module) is not a Class:
+   only Module's mixins count for it. */
+static int class_or_module_reopen_mixes(Compiler *c, int m, int only_module) {
+  int cm[] = { comp_builtin_class_named(c, "Module"), comp_core_class(c, CORE_CLASS_REOPEN) };
+  for (int i = 0; i < (only_module ? 1 : 2); i++) {
+    int k = cm[i];
+    if (k < 0 || k >= c->nclasses) continue;
+    if (k == m) return 1;   /* (the reopening's own method) */
+    const ClassInfo *ki = &c->classes[k];
+    for (int j = 0; j < ki->nincluded_mods; j++) if (comp_module_includes(c, ki->included_mods[j], m, 0)) return 1;
+    for (int j = 0; j < ki->nprepended_mods; j++) if (comp_module_includes(c, ki->prepended_mods[j], m, 0)) return 1;
+  }
+  return 0;
+}
 /* Can a class or module value answer vnm below Object: a class method of
    that name (any_class: of any class), a module's instance method (an
    `extend` gives it; for one known class cls, a module cls extends), or a
-   reopened Class or Module's? */
+   reopened Class or Module's? (cls: -1 for none; -2 for a builtin class,
+   -3 for a builtin module, the program does not reopen) */
 static int object_reopen_class_value_owns(Compiler *c, int id, int oci, const char *vnm, int any_class, int cls) {
   for (int k = 0; k < c->nclasses; k++) {
     if (k == oci) continue;
@@ -22829,6 +22987,12 @@ static int object_reopen_class_value_owns(Compiler *c, int id, int oci, const ch
         call_target(c, id, k, vnm, CT_OWN, NULL) >= 0) {
       /* for one known class, a module counts when that class extends it */
       if (!any_class && !class_reopen && cls >= 0 && !comp_class_singleton_has_module(c, cls, k)) continue;
+      /* for a builtin class or module the program does not reopen (cls -2
+         or -3), which nothing can extend: a module counts when a reopened
+         Class or Module mixes it in (only Module for a module), or, for a
+         class, when Object extends it */
+      if (!any_class && !class_reopen && cls <= -2 && !class_or_module_reopen_mixes(c, k, cls == -3) &&
+          !(cls == -2 && oci >= 0 && comp_class_singleton_has_module(c, oci, k))) continue;
       return 1;
     }
   }
@@ -22877,7 +23041,7 @@ static int emit_object_reopen_vis_refusal(Compiler *c, int id, int vrecv, TyKind
     if (bid && comp_class_index(c, bn) < 0) {
       int mod = is_builtin_module_name(bn);
       if (core_class_value_answers(bn, vnm) || core_class_value_answers(mod ? "Module#" : "Class#", vnm) || builtin_class_id_answers(bid, vnm, 1) || class_value_builtin_answers(c, vnm, !mod) ||
-          object_reopen_class_value_owns(c, id, oci, vnm, 0, -1)) return 0;
+          object_reopen_class_value_owns(c, id, oci, vnm, 0, mod ? -3 : -2)) return 0;
       snprintf(cvname, sizeof cvname, "%s %s", mod ? "module" : "class", bn);
       cname = cvname; named = 1;
     }
@@ -23781,6 +23945,37 @@ static void emit_call_reboxed(Compiler *c, int id, int recv, Buf *b) {
   view_pop(c, vw);
   view_unbind(g_n_argov - 1);
 }
+/* Is node `id` under `root` (a method's def), with the self of the code
+   around it: 1 when it is, 0 when a block that runs with another self
+   (block_self_call names: instance_eval, class_exec, define_method, a class
+   builder's), or a class_eval body spliced in place, holds it, -1 when `root` does not hold it. Nested defs and
+   class bodies are not walked. */
+static int node_self_kept(Compiler *c, int root, int id, int depth) {
+  const NodeTable *nt = c->nt;
+  if (root < 0 || root >= nt->count || depth > 200) return -1;
+  if (root == id) return 1;
+  NodeKind k = nt_kind(nt, root);
+  if (depth > 0 && (k == NK_DefNode || k == NK_ClassNode || k == NK_ModuleNode || k == NK_SingletonClassNode)) return -1;
+  /* a class_eval body spliced in place (desugar_class_eval_value) */
+  if (k == NK_ParenthesesNode && nt_int(nt, root, "self_rebound", 0)) return node_self_kept(c, nt_ref(nt, root, "body"), id, depth + 1) >= 0 ? 0 : -1;
+  int own = -1;
+  if (k == NK_CallNode) {
+    int rv = nt_ref(nt, root, "receiver"), blk = nt_ref(nt, root, "block");
+    const char *rn = rv >= 0 && nt_kind(nt, rv) == NK_ConstantReadNode ? nt_str(nt, rv, "name") : NULL;
+    if (blk >= 0 && nt_kind(nt, blk) == NK_BlockNode && is_block_self_call(rn, nt_str(nt, root, "name"))) own = blk;
+  }
+  const SpNode *nd = &nt->nodes[root];
+  for (int i = 0; i < nd->nr; i++) {
+    int r = node_self_kept(c, nd->r[i].ref, id, depth + 1);
+    if (r >= 0) return nd->r[i].ref == own ? 0 : r;
+  }
+  for (int i = 0; i < nd->na; i++)
+    for (int j = 0; j < nd->a[i].n; j++) {
+      int r = node_self_kept(c, nd->a[i].ids[j], id, depth + 1);
+      if (r >= 0) return r;
+    }
+  return -1;
+}
 int emit_unresolved_call(Compiler *c, int id, Buf *b) {
   const NodeTable *nt = c->nt;
   const char *name = nt_str(nt, id, "name");
@@ -23846,6 +24041,27 @@ int emit_unresolved_call(Compiler *c, int id, Buf *b) {
       buf_puts(b, "(sp_raise_cls(\"NameError\", ");
       if (!st && anon_class_text(c, g_emitting_class_id, head, b)) buf_puts(b, ")");
       else buf_printf(b, "\"undefined local variable or method '%s' for %s\")", vnm ? vnm : "?", st ? st : "main");
+      emit_raise_placeholder(c, id, b);
+      return 1;
+    }
+  }
+  /* `name(2)`, `to_s(1)` or `inspect(1, 2)` in a class method whose class
+     has no class method of the name: self is the class, and Module's reader
+     takes no argument, so CRuby raises the arity ArgumentError once the
+     arguments have run (not the NoMethodError an instance would get). Not
+     inside a block that runs with another self (instance_eval, class_exec,
+     define_method, a class builder's): there self is not the class. */
+  if (recv < 0 && is_name_reader(name) && nt_ref(nt, id, "block") < 0 &&
+      class_name_reader_argc_raises(c, name, argc, argv)) {
+    Scope *ms = comp_scope_of(c, id);
+    if (ms && ms->is_cmethod && ms->class_id >= 0 && ms->def_node >= 0 &&
+        call_target(c, id, ms->class_id, name, CT_CMETHOD, NULL) < 0 &&
+        node_self_kept(c, ms->def_node, id, 0) == 1) {
+      char am[96];
+      class_name_reader_arity_msg(c, name, argc, argv, am, sizeof am);
+      buf_puts(b, "(");
+      for (int k = 0; k < argc; k++) { buf_puts(b, "(void)("); emit_expr_for_effect(c, argv[k], b); buf_puts(b, "), "); }
+      buf_printf(b, "sp_raise_cls(\"ArgumentError\", \"%s\")", am);
       emit_raise_placeholder(c, id, b);
       return 1;
     }
@@ -24337,11 +24553,21 @@ int emit_unresolved_call(Compiler *c, int id, Buf *b) {
             int slot2 = view_bind(recv, "_t%d", tv);
             int sv2 = g_cls_tag_skip;
             g_cls_tag_skip = id;
+            /* (Array#at kept by name for a class method `at`) */
+            char *sv_nm = NULL;
+            int as_at = at_kept_by_name_swap(c, id, nm, argc, argv, &sv_nm);
             emit_boxed(c, id, &eb2);
+            if (as_at) at_kept_by_name_restore(c, id, sv_nm);
             g_cls_tag_skip = sv2;
             view_unbind(g_n_argov - 1);
           }
-          buf_printf(b, "%s) : %s; })", raise,
+          /* a Class value without a method of the name: Module#name, to_s
+             and inspect take no argument, so CRuby raises ArgumentError */
+          char cls_raise[256], am[96];
+          if (is_name_reader(nm) && class_name_reader_arity_msg(c, nm, argc, argv, am, sizeof am))
+            snprintf(cls_raise, sizeof cls_raise, "(sp_raise_cls(\"ArgumentError\", \"%s\"), sp_box_nil())", am);
+          else snprintf(cls_raise, sizeof cls_raise, "%s", raise);
+          buf_printf(b, "%s) : %s; })", cls_raise,
                      (eb2.p && eb2.p[0]) ? eb2.p : raise);
           if (setter_val) { buf_puts(b, "; "); emit_boxed(c, argv[0], b); buf_puts(b, "; })"); }
           if (g_plan_check) pa_end(c, pa_frame, cplan_poly_cmeth(c, id));
@@ -24351,6 +24577,18 @@ int emit_unresolved_call(Compiler *c, int id, Buf *b) {
           return 1;
         }
         free(ccls);
+        /* Array#at kept by name for a class method `at` no arm can reach (a
+           class the program never names as a value, an alias): the index
+           read, as the arms' default above */
+        { char *sv_nm = NULL;
+          if (nsg == 0 && at_kept_by_name_swap(c, id, nm, argc, argv, &sv_nm)) {
+            int sv3 = g_cls_tag_skip;
+            g_cls_tag_skip = id;
+            emit_boxed(c, id, b);
+            g_cls_tag_skip = sv3;
+            at_kept_by_name_restore(c, id, sv_nm);
+            return 1;
+          } }
         /* no class method of the name, but a `class << self` accessor
            (`subclass.features = ...` on a class held boxed): the arms a
            Class-typed value takes, on the class the box holds; any other
@@ -27787,7 +28025,7 @@ int cplan_nil_closed_method(Compiler *c, int call, const char *name, int *vis) {
        first, and so does a `public :name` NilClass declares */
     if (i > 0) {
       int at = -1;
-      if (cplan_nil_own_builtin(name)) return -1;
+      if (builtin_answers_ahead_of("NilClass", name, "Object")) return -1;
       if (nk >= 0 && comp_method_vis_declared(c, nk, name, &at) == SP_VIS_PUBLIC && at == nk) return -1;
     }
     int k = owners[i] == -2 ? oc : comp_core_class(c, owners[i]);
@@ -28350,7 +28588,7 @@ static void refuse_string_copy_named(Compiler *c, int arg, const char *mname, co
 static int refuse_param_copies(Compiler *c, int mi, int j, int arg) {
   Scope *m = &c->scopes[mi];
   LocalVar *q = j < m->nparams && m->pnames[j] ? scope_local(m, m->pnames[j]) : NULL;
-  if (!q || q->byref_out) return 0;
+  if (!q) return 0;
   if (repr_of_slot(c, q).handle) return 0;
   if (q->type == TY_POLY) {
     int shared;
@@ -28832,16 +29070,15 @@ static int block_param_is_handle(Compiler *c, int blk, int k, int n) {
   LocalVar *t = bs ? scope_local(bs, bp) : NULL;
   return repr_of_slot(c, t).handle;
 }
-/* Is `a` a String variable a splice can alias: a local or a parameter, or
-   one lent to this method (a cell that is the caller's slot), not a
-   block's parameter or a variable a proc captures? */
+/* Is `a` a String variable a splice can alias: a local or a parameter, not
+   a block's parameter or a variable a proc captures? */
 static int ie_arg_aliases(Compiler *c, int a) {
   const NodeTable *nt = c->nt;
   if (nt_kind(nt, a) != NK_LocalVariableReadNode || comp_ntype(c, a) != TY_STRING) return 0;
   const char *vn = nt_str(nt, a, "name");
   Scope *vs = vn ? comp_scope_of(c, a) : NULL;
   LocalVar *lv = vs ? scope_local(vs, vn) : NULL;
-  return lv && lv->type == TY_STRING && !lv->is_block_param && (!lv->is_cell || lv->byref_out);
+  return lv && lv->type == TY_STRING && !lv->is_block_param && !lv->is_cell;
 }
 
 /* A method that yields its parameter to a block that appends to it, where
@@ -28949,7 +29186,7 @@ static void splat_appended_param(Compiler *c, int id, const char *name, int recv
     Scope *m = mi >= 0 ? &c->scopes[mi] : NULL;
     for (int j = p < 0 ? 0 : p; m && j < m->nparams && j < 16 && !pname; j++) {
       LocalVar *q = m->pnames[j] ? scope_local(m, m->pnames[j]) : NULL;
-      if (q && (q->byref_out || repr_of_slot(c, q).handle || dyn_method_appends(c, mi, j))) {
+      if (q && (repr_of_slot(c, q).handle || dyn_method_appends(c, mi, j))) {
         pname = m->pnames[j]; mname = m->name;
       }
     }
@@ -29258,7 +29495,7 @@ static void refuse_rest_yield_copies(Compiler *c, int id, int t) {
 /* A method that forwards its rest (`def w(*a) = m(*a)`, `*`, `...`) to a
    parameter that appends, or hands a POLY parameter on to one (`def m(p,
    k:) = super`, called with `**h`): the call's String variable is pulled
-   into the handle (promote_forwarded_rest_args, convert_byref_handle_params),
+   into the handle (promote_forwarded_rest_args, pull_args_into_handle_params),
    but for one that cannot be -- a block's parameter, an ivar that is no
    handle, a global or class variable -- which goes over as a copy. */
 static void refuse_forwarded_args(Compiler *c, int id, const char *name) {
@@ -29341,7 +29578,7 @@ static void refuse_unplaced_lead(Compiler *c, int id, const char *name, int recv
       LocalVar *q = scope_local(m, m->pnames[j]);
       if (!q) continue;
       int handle = repr_of_slot(c, q).handle;
-      if (!(q->byref_out || handle || dyn_method_appends(c, mi, j) ||
+      if (!(handle || dyn_method_appends(c, mi, j) ||
             (q->type == TY_POLY && (q->poly_lift & POLY_LIFT_APPENDED)))) continue;
       if (shared && (handle || q->type == TY_POLY)) continue;
       char why[160], mt[96];
@@ -29365,8 +29602,7 @@ static int nonlocal_string_typed(Compiler *c, int a) {
 /* A global or a class variable handed to a method's parameter that takes
    a String's handle or box and appends to it. The binder wraps a fresh
    handle of its bytes, or boxes a copy, where the variable has no handle
-   of its own to give; only a lent slot (the byref ABI) can carry it. One
-   that holds the handle hands it over. A receiver that is boxed reaches
+   of its own to give. One that holds the handle hands it over. A receiver that is boxed reaches
    every class's method of the name. */
 static void refuse_nonlocal_param_args(Compiler *c, int id, const char *name) {
   const NodeTable *nt = c->nt;
@@ -29408,7 +29644,7 @@ static void refuse_nonlocal_param_args(Compiler *c, int id, const char *name) {
     if (!refuse_call_binds(c, refuse_scope_params(c, m), id, 0, 0)) continue;
     for (int j = 0; j < m->nparams && j < 16; j++) {
       LocalVar *q = m->pnames[j] ? scope_local(m, m->pnames[j]) : NULL;
-      if (!q || q->byref_out) continue;
+      if (!q) continue;
       if (!repr_of_slot(c, q).handle && q->type != TY_POLY) continue;
       int kj = -1;
       if (!dyn_method_appends(c, tg[t], j) && !(q->type == TY_POLY && (q->poly_lift & POLY_LIFT_APPENDED)) &&
@@ -29984,6 +30220,8 @@ static int emit_call_on_missing_builtin_path(Compiler *c, int id, Buf *b) {
   return 1;
 }
 void emit_call(Compiler *c, int id, Buf *b) {
+  if (sp_streq(nt_str(c->nt, id, "name"), "===") &&
+      emit_undefined_const_test(c, nt_ref(c->nt, id, "receiver"), repr_of(c, id).as_ty, b)) return;
   /* a String, Integer or Float that may be nil, for a name the program's
      NilClass has (cplan_nil_scalar_reach): boxed, the poly dispatch runs
      NilClass's method for nil, and for the rest Object's public method of
@@ -30940,22 +31178,6 @@ int emit_implicit_self_member(Compiler *c, int id, Buf *b) {
   return 0;
 }
 
-/* Can this class-method arm take a call with `argc` positional arguments?
-   A candidate that cannot is not a possible receiver for THAT call site --
-   CRuby raises ArgumentError there -- so it must not veto the whole dispatch
-   (#4129). Optional parameters make this a range, not an equality: the old
-   `nrequired == argc` test also refused a candidate with a trailing default
-   called with the argument that fills it. With a splat among the
-   arguments (`splat` of them) the count is known only at run time: each
-   may spread to nothing, so a candidate the other arguments leave room in
-   may take it, and its arm binds through the gather, which judges the
-   count there. */
-int cls_arm_takes_argc(Scope *s, int argc, int splat) {
-  if (s->rest_idx >= 0) return 1;   /* a rest param takes any count */
-  if (splat) return argc - splat <= s->nparams;
-  return argc >= s->nrequired && argc <= s->nparams;
-}
-
 /* 1 if this operand is a user object whose class defines a #coerce with a
    usable SHAPE (one parameter, no rest). Deliberately not class_coerce_emittable:
    that asks whether the coerce dispatch will carry an arm for the class, which
@@ -31159,7 +31381,7 @@ static void emit_callee_local_decls(Compiler *c, Scope *tm, Buf *b) {
   for (int li = 0; li < tm->nlocals; li++) {
     LocalVar *blv = &tm->locals[li];
     if (!blv->name) continue;
-    if (blv->is_param || blv->byref_out) continue;
+    if (blv->is_param) continue;
     if (tm->blk_param && sp_streq(blv->name, tm->blk_param)) continue;
     /* The method prologue normalizes an untyped block param to a boxed slot;
        this frame may be emitted before that prologue runs, and declare_local
@@ -31290,7 +31512,7 @@ int declare_default_locals(Compiler *c, Scope *m, int dnode) {
   int uid = 0;
   for (int i = 0; i < nn; i++) {
     LocalVar *lv = scope_local(m, names[i]);
-    if (!lv || lv->is_param || lv->byref_out) continue;
+    if (!lv || lv->is_param) continue;
     if (m->blk_param && sp_streq(lv->name, m->blk_param)) continue;
     if (!sp_streq(rename_local(lv->name), lv->name)) continue;
     if (nread < 0) {
@@ -32793,8 +33015,7 @@ void emit_bound_method_call(Compiler *c, int id, int recv, int target, Buf *b) {
   for (int k = 0; k < tm->nparams; k++) {
     if (np++) buf_puts(&cast, ", ");
     LocalVar *pp = tm->pnames[k] ? scope_local(tm, tm->pnames[k]) : NULL;
-    if (pp && pp->byref_out) buf_printf(&cast, "%s *", borrowed_string_type(pp));
-    else if (pp) emit_slot_ctype(c, pp, &cast);   /* a param holding its nil is an oint */
+    if (pp) emit_slot_ctype(c, pp, &cast);   /* a param holding its nil is an oint */
     else emit_ctype(c, TY_POLY, &cast);
   }
   if (tm->blk_param && tm->blk_param[0] && !tm->yields) buf_puts(&cast, np++ ? ", sp_Proc *" : "sp_Proc *");
@@ -34649,7 +34870,7 @@ static int emit_reopen_call_first(Compiler *c, int id, int recv, TyKind rt, cons
   int still = !(rpre.p && rpre.p[0]) && !(pre.p && pre.p[0]) && argc == m->nparams;
   for (int i = 0; still && i < argc; i++) {
     LocalVar *p = scope_local(m, m->pnames[i]);
-    still = p && !p->byref_out && p->type == comp_ntype(c, argv[i]) && subtree_is_pure_read(c, argv[i]);
+    still = p && p->type == comp_ntype(c, argv[i]) && subtree_is_pure_read(c, argv[i]);
   }
   if (rt == TY_STRING && (reread || still)) buf_printf(b, "const char *_t%d = %s; ", t, rx.p ? rx.p : "NULL");
   else if (rt == TY_STRING) buf_printf(b, "const char *_t%d = %s; SP_GC_ROOT_STR(_t%d); ", t, rx.p ? rx.p : "NULL", t);
@@ -34744,6 +34965,9 @@ static int emit_cext_call(Compiler *c, int id, Buf *b) {
 
 static void emit_call_body_ordinary(Compiler *c, int id, Buf *b);
 void emit_call_body(Compiler *c, int id, Buf *b) {
+#ifdef SP_EMIT_TRACE
+  emit_trace_node(c, id, 'c');
+#endif
   if (emit_cext_call(c, id, b) || emit_missing_call(c, id, b)) return;
   emit_call_body_ordinary(c, id, b);
 }

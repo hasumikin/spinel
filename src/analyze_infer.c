@@ -693,18 +693,46 @@ static int hv_slot_key(Compiler *c, int node, int *kind, int *owner, const char 
   }
   return 0;
 }
+/* slot + 1 by (kind, owner, name), open addressed: every read of a hash
+   asks, and a scan of the slots per question was quadratic in them */
+static int *g_hv_tab, g_hv_tab_cap, g_hv_tab_n;
+static unsigned hv_hash(int kind, int owner, const char *name) {
+  return (sp_strhash(name) * 31u + (unsigned)owner) * 2u + (unsigned)kind;
+}
+static void hv_tab_put(int i) {
+  unsigned m = (unsigned)g_hv_tab_cap - 1, h = hv_hash(g_hv[i].kind, g_hv[i].owner, g_hv[i].name) & m;
+  while (g_hv_tab[h]) h = (h + 1) & m;
+  g_hv_tab[h] = i + 1;
+}
 static HvSlot *hv_find(int kind, int owner, const char *name, int create) {
-  for (int i = 0; i < g_hv_n; i++)
-    if (g_hv[i].kind == kind && g_hv[i].owner == owner && sp_streq(g_hv[i].name, name)) return &g_hv[i];
+  if (g_hv_tab_n != g_hv_n) {
+    if (g_hv_tab) memset(g_hv_tab, 0, sizeof(int) * (size_t)g_hv_tab_cap);
+    g_hv_tab_n = g_hv_n;
+  }
+  if (g_hv_tab) {
+    unsigned m = (unsigned)g_hv_tab_cap - 1;
+    for (unsigned h = hv_hash(kind, owner, name) & m; g_hv_tab[h]; h = (h + 1) & m) {
+      HvSlot *e = &g_hv[g_hv_tab[h] - 1];
+      if (e->kind == kind && e->owner == owner && sp_streq(e->name, name)) return e;
+    }
+  }
   if (!create) return NULL;
   if (g_hv_n == g_hv_cap) {
     g_hv_cap = g_hv_cap ? g_hv_cap * 2 : 64;
     g_hv = realloc(g_hv, sizeof(HvSlot) * (size_t)g_hv_cap);
     if (!g_hv) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
   }
+  if (2 * (g_hv_n + 1) > g_hv_tab_cap) {
+    g_hv_tab_cap = g_hv_tab_cap ? 2 * g_hv_tab_cap : 256;
+    free(g_hv_tab);
+    g_hv_tab = calloc((size_t)g_hv_tab_cap, sizeof(int));
+    if (!g_hv_tab) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    for (int i = 0; i < g_hv_n; i++) hv_tab_put(i);
+  }
   HvSlot *h = &g_hv[g_hv_n++];
   h->kind = kind; h->owner = owner; h->name = strdup(name); h->cls = -1; h->bad = 0; h->writes = 0;
   if (!h->name) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  hv_tab_put(g_hv_n - 1); g_hv_tab_n = g_hv_n;
   return h;
 }
 /* The hash operations a slot may be the receiver of, with their argument and
@@ -734,7 +762,7 @@ static void hv_build(Compiler *c) {
   const NodeTable *nt = c->nt;
   g_hv_building = 1;
   for (int i = 0; i < g_hv_n; i++) free(g_hv[i].name);
-  g_hv_n = 0;
+  g_hv_n = 0; g_hv_tab_n = -1;
   int n = nt->count;
   unsigned char *ok = calloc((size_t)(n > 0 ? n : 1), 1);
   if (!ok) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
@@ -1617,6 +1645,100 @@ static int an_row_from_untyped_slot(Compiler *c, int n) {
   return u.hit;
 }
 
+/* The writes and `[]=` / `store` calls of each constant name, in node
+   order, for the tree as it is: the question is asked once a round for
+   each constant table read, and each walked the whole table */
+typedef struct { const NodeTable *nt; unsigned ver; unsigned long edits; int count; ANameHash names; int **ids, *n, cap; } NameNodes;
+static void nnodes_free_ids(int **p) { free(*p); }
+static int nnodes_cmp(const void *a, const void *b) { return *(const int *)a - *(const int *)b; }
+static void nnodes_add(NameNodes *x, const char *nm, int id) {
+  int i = anh_find(&x->names, nm);
+  if (i < 0) {
+    if (x->names.n == x->cap) {
+      x->cap = x->cap ? x->cap * 2 : 64;
+      x->ids = realloc(x->ids, sizeof(int *) * (size_t)x->cap);
+      x->n = realloc(x->n, sizeof(int) * (size_t)x->cap);
+      if (!x->ids || !x->n) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    }
+    i = x->names.n;
+    x->ids[i] = NULL; x->n[i] = 0;
+    anh_add(&x->names, nm);
+  }
+  int m = x->n[i];
+  if ((m & (m - 1)) == 0) {
+    x->ids[i] = realloc(x->ids[i], sizeof(int) * (size_t)(m ? 2 * m : 1));
+    if (!x->ids[i]) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  }
+  x->ids[i][x->n[i]++] = id;
+}
+/* 1 when x must be filled again for the tree as it is (emptied here) */
+static int nnodes_stale(NameNodes *x, const NodeTable *nt) {
+  if (x->nt == nt && x->ver == nt->version && x->edits == nt->edits && x->count == nt->count) return 0;
+  for (int i = 0; i < x->names.n; i++) free(x->ids[i]);
+  anh_free(&x->names); memset(&x->names, 0, sizeof x->names);
+  x->nt = nt; x->ver = nt->version; x->edits = nt->edits; x->count = nt->count;
+  return 1;
+}
+/* name's nodes, in node order, as a copy the caller frees: a question asked
+   while walking them may edit the tree, and the index goes with it */
+static int *nnodes_of(NameNodes *x, const char *nm, int *count) {
+  int i = anh_find(&x->names, nm);
+  *count = i >= 0 ? x->n[i] : 0;
+  if (*count == 0) return NULL;
+  int *r = malloc(sizeof(int) * (size_t)*count);
+  if (!r) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  memcpy(r, x->ids[i], sizeof(int) * (size_t)*count);
+  return r;
+}
+static void nnodes_sort(NameNodes *x) {
+  for (int i = 0; i < x->names.n; i++) qsort(x->ids[i], (size_t)x->n[i], sizeof(int), nnodes_cmp);
+}
+static NameNodes g_cwr;
+static int *const_writes_of(const NodeTable *nt, const char *cname, int *count) {
+  if (nnodes_stale(&g_cwr, nt)) {
+    NT_FOREACH_KIND(nt, NK_ConstantWriteNode, id) {
+      const char *nm = nt_str(nt, id, "name");
+      if (nm) nnodes_add(&g_cwr, nm, id);
+    }
+    NT_FOREACH_KIND(nt, NK_CallNode, id) {
+      const char *nm = nt_str(nt, id, "name");
+      if (!nm || (!sp_streq(nm, "[]=") && !sp_streq(nm, "store"))) continue;
+      int recv = nt_ref(nt, id, "receiver");
+      if (recv < 0 || nt_kind(nt, recv) != NK_ConstantReadNode) continue;
+      const char *rn = nt_str(nt, recv, "name");
+      if (rn) nnodes_add(&g_cwr, rn, id);
+    }
+    nnodes_sort(&g_cwr);
+  }
+  return nnodes_of(&g_cwr, cname, count);
+}
+/* The same for an ivar name: its stores (the calls the scan below vets) and
+   its writes, and apart, its reads and op-writes */
+static NameNodes g_ivst, g_ivrd;
+static void ivar_nodes_index(const NodeTable *nt) {
+  if (!nnodes_stale(&g_ivst, nt)) return;
+  nnodes_stale(&g_ivrd, nt);
+  NT_FOREACH_KIND(nt, NK_CallNode, id) {
+    const char *nm = nt_str(nt, id, "name");
+    if (!nm || (!is_store_alias(nm) && !sp_streq(nm, "insert") && !sp_streq(nm, "concat") && !is_array_push_family(nm))) continue;
+    int recv = nt_ref(nt, id, "receiver");
+    if (recv < 0 || nt_kind(nt, recv) != NK_InstanceVariableReadNode) continue;
+    const char *rn = nt_str(nt, recv, "name");
+    if (rn) nnodes_add(&g_ivst, rn, id);
+  }
+  NT_FOREACH_KIND(nt, NK_InstanceVariableWriteNode, id) {
+    const char *nm = nt_str(nt, id, "name");
+    if (nm) nnodes_add(&g_ivst, nm, id);
+  }
+  static const NodeKind rd[] = { NK_InstanceVariableReadNode, NK_InstanceVariableOperatorWriteNode,
+                                 NK_InstanceVariableOrWriteNode, NK_InstanceVariableAndWriteNode };
+  for (int k = 0; k < 4; k++)
+    NT_FOREACH_KIND(nt, rd[k], id) {
+      const char *nm = nt_str(nt, id, "name");
+      if (nm) nnodes_add(&g_ivrd, nm, id);
+    }
+  nnodes_sort(&g_ivst); nnodes_sort(&g_ivrd);
+}
 /* Whether every element stored into poly-array ivar `@<ivname>` is an int
    array (a nested array of int arrays, e.g. @chr_banks / @nmt_mem). Element
    reads then yield an int array rather than a boxed poly. */
@@ -1640,10 +1762,13 @@ static int ivar_array_elems_all_int_array_impl(Compiler *c, int cid, const char 
   const char *bare = ivname[0] == '@' ? ivname + 1 : ivname;
   ClassInfo *cl = &c->classes[cid];
   if (comp_is_reader(cl, bare) || comp_is_writer(cl, bare)) return 0;
-  for (int id = 0; id < nt->count; id++) {
-    const char *ty = nt_type(nt, id);
+  ivar_nodes_index(nt);
+  int nst = 0, nrd = 0;
+  int *st __attribute__((cleanup(nnodes_free_ids))) = nnodes_of(&g_ivst, ivname, &nst);
+  int *rdv __attribute__((cleanup(nnodes_free_ids))) = nnodes_of(&g_ivrd, ivname, &nrd);
+  for (int si = 0; si < nst; si++) {
+    int id = st[si];
     NodeKind ty_k = nt_kind(nt, id);
-    if (!ty) continue;
     if (ty_k == NK_CallNode) {
       const char *nm = nt_str(nt, id, "name");
       if (!nm) continue;
@@ -1733,7 +1858,8 @@ static int ivar_array_elems_all_int_array_impl(Compiler *c, int cid, const char 
      where this scan does not look. */
   int *parent = an_parent_map(nt);
   if (!parent) return 0;
-  for (int id = 0; id < nt->count && saw; id++) {
+  for (int ri = 0; ri < nrd && saw; ri++) {
+    int id = rdv[ri];
     NodeKind k = nt_kind(nt, id);
     int is_read = k == NK_InstanceVariableReadNode;
     if (!is_read && k != NK_InstanceVariableOperatorWriteNode &&
@@ -1801,11 +1927,11 @@ static int ivar_array_elems_all_int_array(Compiler *c, int cid, const char *ivna
    any `CNAME[i] = v` mutation must agree. */
 static int const_array_elems_all_int_array_impl(Compiler *c, const char *cname) {
   const NodeTable *nt = c->nt;
-  int saw = 0;
-  for (int id = 0; id < nt->count; id++) {
-    const char *ty = nt_type(nt, id);
+  int saw = 0, nw = 0;
+  int *ws __attribute__((cleanup(nnodes_free_ids))) = const_writes_of(nt, cname, &nw);
+  for (int wi = 0; wi < nw; wi++) {
+    int id = ws[wi];
     NodeKind k = nt_kind(nt, id);
-    if (!ty) continue;
     if (k == NK_CallNode) {
       const char *nm = nt_str(nt, id, "name");
       if (!nm || (!sp_streq(nm, "[]=") && !sp_streq(nm, "store"))) continue;
@@ -2323,14 +2449,10 @@ static int an_module_tree(Compiler *c, int m, int *mods, int *n, int cap) {
     int sn = 0;
     const int *stmts = ob[b].body >= 0 ? nt_arr(nt, ob[b].body, "body", &sn) : NULL;
     for (int k = 0; k < sn; k++) {
-      if (nt_kind(nt, stmts[k]) != NK_CallNode || nt_ref(nt, stmts[k], "receiver") >= 0) continue;
-      const char *nm = nt_str(nt, stmts[k], "name");
-      if (!nm) continue;
-      if (is_prepend_name(nm)) return 0;
-      if (!is_include_name(nm)) continue;
-      int an = 0, anode = nt_ref(nt, stmts[k], "arguments");
-      const int *aa = anode >= 0 ? nt_arr(nt, anode, "arguments", &an) : NULL;
-      if (an == 0) return 0;
+      int prep = 0; const int *aa;
+      int an = mixin_stmt_args(nt, stmts[k], &prep, &aa);
+      if (an < 0) continue;
+      if (prep || an == 0) return 0;
       for (int j = 0; j < an; j++) {
         NodeKind ak = nt_kind(nt, aa[j]);
         int im = ak == NK_ConstantReadNode || ak == NK_ConstantPathNode ? class_recv_static_ci(c, aa[j]) : -1;
@@ -3199,7 +3321,7 @@ int sclass_value_call(Compiler *c, int id) {
 
 int object_reopen_answers(Compiler *c, const char *cls, int call_id, TyKind *out) {
   const char *name = nt_str(c->nt, call_id, "name");
-  if (!name || builtin_method_known(cls, name) || builtin_object_method_known(name)) return 0;
+  if (!name || builtin_answers_ahead_of(cls, name, "Object") || builtin_object_method_known(name)) return 0;
   int oci = comp_core_class(c, CORE_OBJECT);
   int omi = oci >= 0 ? call_target(c, call_id, oci, name, 0, NULL) : -1;
   if (omi < 0) return 0;
@@ -6124,8 +6246,10 @@ static int infer_class_module_call(Compiler *c, int id, const NodeTable *nt, con
     /* Module#name / to_s / inspect, unless the class answers with a class
        method of its own (`def self.name = Thread.current[:name]`), whose
        dispatch below types the call. A class known only at run time may be
-       one with such a method or one without: boxed, either answer. */
-    if (argc == 0 && is_name_reader(name) && class_recv_user_cmethod(c, id, recv, name) < 0) {
+       one with such a method or one without: boxed, either answer. With
+       arguments the builtin raises ArgumentError, so its slot stays a String. */
+    if (is_name_reader(name) && (argc == 0 || class_name_reader_argc_raises(c, name, argc, argv)) &&
+        class_recv_user_cmethod(c, id, recv, name) < 0) {
       int ncc = 0, other = 0;
       const PolyCand *pc = NULL;
       if (class_recv_static_ci(c, recv) < 0 && class_recv_is_dynamic(c, recv))
@@ -6159,8 +6283,8 @@ static int infer_class_module_call(Compiler *c, int id, const NodeTable *nt, con
       LocalVar *cv = cs_qm ? comp_const(c, cs_qm) : NULL;
       if (cv && cv->type != TY_UNKNOWN) { *out = cv->type; return 1; }
     }
-    if (sp_streq(name, "constants") && argc <= 1) { *out = TY_POLY_ARRAY; return 1; }
-    if (sp_streq(name, "class_variables") && argc == 0) { *out = TY_POLY_ARRAY; return 1; }
+    if (sp_streq(name, "constants") && argc <= 1 && class_recv_user_cmethod(c, id, recv, name) < 0) { *out = TY_POLY_ARRAY; return 1; }
+    if (sp_streq(name, "class_variables") && argc == 0 && class_recv_user_cmethod(c, id, recv, name) < 0) { *out = TY_POLY_ARRAY; return 1; }
     if (sp_streq(name, "included_modules") && argc == 0) { *out = TY_POLY_ARRAY; return 1; }
     if (argc == 0 && sp_streq(name, "class")) { *out = TY_CLASS; return 1; }
     /* #superclass is a (nullable) class value: BasicObject's is the nil-class
@@ -6221,24 +6345,20 @@ static int infer_class_module_call(Compiler *c, int id, const NodeTable *nt, con
            arm the emitter can build, so it kills the whole dispatch. A
            candidate with the WRONG ARITY does not: this call cannot reach it,
            so it neither contributes a return type nor vetoes the others
-           (#4129). Codegen's cls_arm_takes_argc is the same rule.
+           (#4129). Codegen's arms ask the same cplan_cls_arm_takes.
            A candidate taking a block (a yielding one through its
            proc form) is reached by the poly receiver's class-tag dispatch
            instead, which answers poly. */
         if ((c->scopes[kmi].rest_idx < 0 || rest_packable_arm(c, &c->scopes[kmi])) &&
             (c->scopes[kmi].yields || (c->scopes[kmi].blk_param && c->scopes[kmi].blk_param[0]))) {
-          if (c->scopes[kmi].rest_idx >= 0 || (splat ? argc - splat <= c->scopes[kmi].nparams : argc >= c->scopes[kmi].nrequired && argc <= c->scopes[kmi].nparams)) nblk++;
+          if (cplan_cls_arm_takes(c, id, kmi, argc, splat)) nblk++;
           continue;
         }
         /* a *rest the emitter packs is an arm like any other */
         int rest_ok = rest_packable_arm(c, &c->scopes[kmi]);
         if ((c->scopes[kmi].rest_idx >= 0 && !rest_ok) || c->scopes[kmi].yields ||
             (c->scopes[kmi].blk_param && c->scopes[kmi].blk_param[0])) { nc = 0; nblk = 0; break; }
-        /* with a splat, the count is the gather's to judge at run time: each
-           splat may spread to nothing, so only the other arguments count */
-        if (splat ? c->scopes[kmi].rest_idx < 0 && argc - splat > c->scopes[kmi].nparams
-                  : argc < c->scopes[kmi].nrequired ||
-                    (c->scopes[kmi].rest_idx < 0 && argc > c->scopes[kmi].nparams)) continue;
+        if (!cplan_cls_arm_takes(c, id, kmi, argc, splat)) continue;
         nc++;
         TyKind kr = (TyKind)c->scopes[kmi].ret;
         if (!set) { uret = kr; set = 1; }
@@ -6521,6 +6641,9 @@ static int infer_class_module_call(Compiler *c, int id, const NodeTable *nt, con
       if (bcn && sp_streq(bcn, "Object")) { *out = TY_POLY; return 1; }
       if (bcn && sp_streq(bcn, "Integer")) { *out = TY_POLY; return 1; }
     }
+    /* a class value no constant names (`x.class.allocate`): boxed, as the
+       sp_cls_allocate that answers it is (comp_class_value_allocate) */
+    if (comp_class_value_allocate(c, id)) { *out = TY_POLY; return 1; }
   }
   return 0;
 }
@@ -6826,7 +6949,7 @@ static int infer_receiverless_call(Compiler *c, int id, const NodeTable *nt, con
 /* A method the program defines on the receiver (a class method, a Struct's member, a reopened builtin's method) and instance-variable reflection (infer_call_inner's rules, in their order) */
 /* Does an Integer or Float reopening's method answer call id, as
    infer_user_method_call's reopen lookup finds it? */
-static int an_scalar_reopen_answers(Compiler *c, int id, const char *name, int recv, TyKind rt, int bonly) {
+int an_scalar_reopen_answers(Compiler *c, int id, const char *name, int recv, TyKind rt, int bonly) {
   if (recv < 0 || bonly || !name || (rt != TY_INT && rt != TY_FLOAT) || nt_int(c->nt, id, "builtin_only", 0)) return 0;
   int ci = comp_core_class(c, core_of_type(rt));
   int mi = ci >= 0 ? call_target(c, id, ci, name, 0, NULL) : -1;
@@ -10395,29 +10518,24 @@ static TyKind an_branch_ty(Compiler *c, int stmts) {
   return t;
 }
 
-/* 1 when a value (a branch arm, a write's right side, a returned value) is
-   an empty `[]` literal or `Array.new`, 2 for an empty `{}` or `Hash.new`.
-   With seq 0 a `(a; b)` is not looked through. */
-static int an_empty_container_at(Compiler *c, int b, int seq) {
+/* 1 when node b is an empty `[]` literal or `Array.new`, 2 for an empty `{}`
+   or `Hash.new`: what a value ends in once the wrappers are looked through. */
+static int an_empty_container_leaf(Compiler *c, int b) {
   const NodeTable *nt = c->nt;
-  while (b >= 0) {
-    NodeKind k = nt_kind(nt, b);
-    if (k == NK_ParenthesesNode && !seq && nt_paren_single(nt, b) == b) return 0;
-    if (k == NK_ElseNode || k == NK_ParenthesesNode) { b = nt_ref(nt, b, k == NK_ElseNode ? "statements" : "body"); continue; }
-    if (k == NK_StatementsNode) {
-      int n = 0; const int *ids = nt_arr(nt, b, "body", &n);
-      if (n <= 0) return 0;
-      b = ids[n - 1];
-      continue;
-    }
-    int n = 0;
-    if (k == NK_ArrayNode) { nt_arr(nt, b, "elements", &n); return n == 0 ? 1 : 0; }
-    if (k == NK_HashNode) { nt_arr(nt, b, "elements", &n); return n == 0 ? 2 : 0; }
-    return k == NK_CallNode ? an_empty_container_new(c, b) : 0;
-  }
-  return 0;
+  NodeKind k = nt_kind(nt, b);
+  int n = 0;
+  if (k == NK_ArrayNode) { nt_arr(nt, b, "elements", &n); return n == 0 ? 1 : 0; }
+  if (k == NK_HashNode) { nt_arr(nt, b, "elements", &n); return n == 0 ? 2 : 0; }
+  return k == NK_CallNode ? an_empty_container_new(c, b) : 0;
 }
-int an_empty_container_kind(Compiler *c, int b) { return an_empty_container_at(c, b, 1); }
+/* 1 when a value (a branch arm, a write's right side, a returned value) is
+   an empty `[]` literal or `Array.new`, 2 for an empty `{}` or `Hash.new`,
+   seen through parentheses, statement lists, an else and an `in` clause
+   (which no caller passes). */
+int an_empty_container_kind(Compiler *c, int b) {
+  if (vp_one(c->nt, b, VPS_NONE, &b) != VP1_NODE) return 0;
+  return an_empty_container_leaf(c, b);
+}
 /* `(a; b)` is its last statement. An empty `[]` / `{}` there reads UNKNOWN
    for want of an element type, and unlike `([])` a sequence is not looked
    through by the slot that takes it: nothing settled a type, the consumer
@@ -10469,7 +10587,11 @@ int an_empty_container_disagrees(int kind, TyKind other) {
    `c ? [1, 2] : []` (whose ElseNode the tail check does not open) was not.
    A `(a; [])` is a value of its own (an_paren_ty), not an arm's literal. */
 static int an_empty_array_takes(Compiler *c, int b, TyKind other) {
-  return (other == TY_INT_ARRAY || other == TY_FLOAT_ARRAY || other == TY_STR_ARRAY) && an_empty_container_at(c, b, 0) == 1;
+  if (other != TY_INT_ARRAY && other != TY_FLOAT_ARRAY && other != TY_STR_ARRAY) return 0;
+  /* (a `(a; [])` or `()` is a leaf here, at any level: the arm emitter does
+     not build the sequence's literal at the result's kind) */
+  if (vp_one(c->nt, b, VPS_NONE | VP_PAREN_ONE, &b) != VP1_NODE) return 0;
+  return an_empty_container_leaf(c, b) == 1;
 }
 
 /* A conditional's answer where an arm ends in an empty container (its arms
@@ -11296,10 +11418,14 @@ static int range_end_no_number(Compiler *c, int node) {
   if (range_end_nonnum_value(c, node)) return 1;
   /* a local: the values its writes in this scope bind (`lo = "a"; lo = 1 if c`) */
   const NodeTable *nt = c->nt;
+  if (vp_one(nt, node, VPS_NONE | VP_PARENS_ONLY, &node) != VP1_NODE) return 0;   /* `((t)..x)` */
   if (nt_kind(nt, node) != NK_LocalVariableReadNode) return 0;
   const char *vn = nt_str(nt, node, "name");
   Scope *sc = comp_scope_of(c, node);
   if (!vn || !sc) return 0;
+  /* a Time (or Complex, ...) parameter boxed for its nil default */
+  LocalVar *pv = scope_local(sc, vn);
+  if (pv && pv->nil_default_boxed) return 1;
   for (int w = comp_lvw_first_sc(c, (int)(sc - c->scopes), vn); w >= 0; w = comp_lvw_next_sc(c, w)) {
     const char *wn = nt_str(nt, w, "name");
     if (!wn || !sp_streq(wn, vn) || comp_scope_of(c, w) != sc) continue;
@@ -11510,6 +11636,11 @@ TyKind infer_uncached(Compiler *c, int id) {
     if (!clamp_arg && (lt == TY_TIME || ht == TY_TIME) &&
         (lo < 0 || lt == TY_TIME || lt == TY_NIL) && (hi < 0 || ht == TY_TIME || ht == TY_NIL))
       return TY_TIME_RANGE;
+    /* a Time beside a boxed end (a parameter with a nil default, boxed):
+       sp_range_new_box makes the Range of Times, or raises CRuby's
+       ArgumentError for an end of another class */
+    if (!clamp_arg && ((lt == TY_TIME && ht == TY_POLY) || (lt == TY_POLY && ht == TY_TIME)))
+      return TY_POLY;
     /* (d1..d2): ends of one class of the program's that defines <=> (a Date)
        make a Range of objects, its ends boxed */
     {
@@ -11848,9 +11979,6 @@ TyKind infer_uncached(Compiler *c, int id) {
     /* an exception class with no cls_id of its own (SystemCallError,
        LoadError) is still a first-class Class value, carried by name */
     if (nm && is_builtin_exception_name(nm)) return TY_CLASS;
-    /* `OpenStruct` as a value (o.class == OpenStruct) resolves only under
-       require "ostruct" (#3155). */
-    if (nm && sp_streq(nm, "OpenStruct") && sp_feature_required("ostruct")) return TY_CLASS;
     return TY_UNKNOWN;
   }
   if (nk == NK_DefinedNode) return TY_STRING;  /* a label string, or nil (NULL) */
@@ -12219,8 +12347,11 @@ TyKind infer_uncached(Compiler *c, int id) {
        comp_super_class_new_boxed) */
     if (comp_super_is_class_new(c, id))
       return comp_super_class_new_boxed(c, id) ? TY_POLY : ty_object(s->class_id);
+    /* Class#allocate from an own allocate: an empty object of the class
+       the method (or its copy for a subclass) runs for */
+    if (allocate_super_reaches_class(c, id)) return ty_object(s->class_id);
     int p = ml.from;
-    const char *uname = comp_super_name(c, p, comp_scope_def_name(c, comp_super_site(c, s)), s->is_cmethod);
+    const char *uname = comp_super_name(c, p, comp_super_site(c, s));
     /* `super` in a respond_to? override no ancestor defines is Object's
        respond_to?: a boolean (see emit_super_respond_to) */
     int rto_super = !s->is_cmethod && uname &&
@@ -13097,11 +13228,18 @@ void infer_subtree(Compiler *c, int id) {
 
 /* ---- scope assignment ---- */
 
+/* Room for one more entry in s's pnames and pdefault: both arrays are
+   pcap long, however the scope came by them. */
+void scope_reserve_param(Scope *s) {
+  if (s->nparams < s->pcap) return;
+  s->pcap = s->pcap + 8;
+  s->pnames = realloc(s->pnames, sizeof(char *) * (size_t)s->pcap);
+  s->pdefault = realloc(s->pdefault, sizeof(int) * (size_t)s->pcap);
+  if (!s->pnames || !s->pdefault) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+}
+
 void scope_add_param(Scope *s, const char *name, int defnode) {
-  if (s->nparams % 8 == 0) {
-    s->pnames = realloc(s->pnames, sizeof(char *) * (size_t)(s->nparams + 8));
-    s->pdefault = realloc(s->pdefault, sizeof(int) * (size_t)(s->nparams + 8));
-  }
+  scope_reserve_param(s);
   s->pdefault[s->nparams] = defnode;
   s->pnames[s->nparams++] = strdup(name);
   if (defnode < 0) s->nrequired = s->nparams;
@@ -13124,7 +13262,7 @@ int super_reaches_exc_text(Compiler *c, int id, int reopen) {
       !class_is_exc_subclass(c, s->class_id))
     return 0;
   int p = comp_super_parent(c, s->class_id, 0);
-  const char *uname = comp_super_name(c, p, comp_scope_def_name(c, s), 0);
+  const char *uname = comp_super_name(c, p, s);
   if (!uname || !is_exception_message(uname) || (p >= 0 && comp_method_in_chain(c, p, uname, NULL) >= 0))
     return 0;
   int xr[8], xn = reopen ? exc_reopen_definers(c, uname, xr, 8) : 0;

@@ -113,6 +113,8 @@ int any_class_responds(Compiler *c, const char *qm);
 int class_implicit_responds(Compiler *c, int cid, const char *qm);
 int class_struct_kind(Compiler *c, int cid);
 int class_value_responds(Compiler *c, int tv, const char *qm, Buf *b);
+void class_value_responds_runtime(int tv, Buf *b);
+void emit_class_value_responds_helper(Compiler *c, const char *const *texts, int ntexts, Buf *protos, Buf *defs);
 extern const char *const comparable_names[];
 int const_name_is_wrong(const char *s);
 int emit_io_pick(Compiler *c, int tv, const char *name, int public_only, Buf *b);
@@ -207,11 +209,13 @@ int emit_user_new_arm(Compiler *c, int id, int ci, int argc, const int *atmp, in
 extern int g_ctor_blk_tmp;
 int hoist_ctor_block(Compiler *c, int id, Buf *b);
 int struct_nil_fills(const ClassInfo *k);
-int cls_arm_takes_argc(Scope *s, int argc, int splat);
 int collect_class_constants(Compiler *c, int ci, int inherit, const char **out, const char **shown,
                             int max, int n, int depth);
 void emit_class_id_is(Compiler *c, int cname, const char *expr, Buf *b);
 int emit_reopen_arm_test(Compiler *c, int kmi, const char *name, const char *cls, const char *raise, Buf *b);
+/* The ArgumentError text of Module#name / to_s / inspect given these
+   arguments; 0 when there are none or only the run time knows the count */
+int class_name_reader_arity_msg(Compiler *c, const char *nm, int argc, const int *argv, char *am, size_t n);
 extern int g_cls_value_recv;
 int hoist_dispatch_args(Compiler *c, int argsN, int **sv, int **vw);
 /* A boxed Integer or Float at a call no target answers: the arms that

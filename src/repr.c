@@ -225,7 +225,7 @@ static int node_is_oint_asked(Compiler *c, int node) {
       int bb = nt_ref(nt, blk, "body");
       int bn = 0; const int *bs = bb >= 0 ? nt_arr(nt, bb, "body", &bn) : NULL;
       if (bn > 0 && (node_has_oint_form(c, bs[bn - 1]) || nt_kind(nt, bs[bn - 1]) == NK_NilNode)) return 1;
-      return bb >= 0 && block_next_may_be_nil(c, bb, 0);
+      return bb >= 0 && block_next_may_be_nil(c, bb);
     }
     /* `a[i] = v` on an Integer / Float array answers v as it was stored:
        with its nil (a nil, a boxed value, an oint) -- emit_array_call's
@@ -270,7 +270,7 @@ static int node_is_oint_asked(Compiler *c, int node) {
       int bb = nt_ref(nt, ieb, "body");
       int bn = 0; const int *bs = bb >= 0 ? nt_arr(nt, bb, "body", &bn) : NULL;
       return (bn > 0 && node_is_oint(c, bs[bn - 1])) ||
-             (bb >= 0 && (block_next_may_be_nil(c, bb, 0) || block_break_may_be_nil(c, bb, 0)));
+             (bb >= 0 && (block_next_may_be_nil(c, bb) || block_break_may_be_nil(c, bb)));
     }
     /* Array's, Hash's or String's own method on an instance of a subclass
        of one (comp_arysub_call, a `super` into it too): the rows below for
@@ -612,9 +612,7 @@ static void repr_layout(Repr *r, TyKind t) {
    proven to hold only a PolyArray or nil. A read of the local says the
    same. */
 static void repr_slot_storage(Repr *r, const LocalVar *lv) {
-  r->cell = (unsigned char)(lv->byref_out ? RC_BYREF : lv->inline_alias ? RC_ALIAS
-                            : lv->is_cell ? RC_HEAP : RC_NONE);
-  r->volatile_str = lv->borrowed_volatile != 0;
+  r->cell = (unsigned char)(lv->inline_alias ? RC_ALIAS : lv->is_cell ? RC_HEAP : RC_NONE);
   r->arr_or_nil = lv->arr_or_nil == 1 && lv->type == TY_POLY;
 }
 
@@ -1496,8 +1494,8 @@ int repr_coerce_plan(Compiler *c, int node, TyKind slot, int how, TyKind *from_o
   if (slot == TY_BIGINT && from == TY_INT) return CF_INT2BIG;
   /* a String into the shared handle slot an ivar holds under the share
      rule: the handle the value is, or a fresh one around it, as a plain
-     `@x = v` stores it. A frozen literal is the handle of its own site
-     (SP_SHARE_STRING_LITERALS), so it keeps one identity and stays frozen */
+     `@x = v` stores it. A frozen literal is the handle of its own site,
+     so it keeps one identity and stays frozen */
   if (slot == TY_STRBUF && how == CO_HOLD && from == TY_STRING) return CF_STRBUF_HANDLE;
   if (from == TY_POLY && how == CO_HOLD) {
     if (repr_poly_rhs_ok(slot)) return CF_POLY_RHS;
@@ -1722,7 +1720,6 @@ Repr repr_of_slot(const Compiler *c, const LocalVar *lv) {
   if (lv->type == TY_STRBUF && lv->str_shared) r.handle = 1;
   /* under the rule, that handle is the one it assigned */
   r.share = r.handle;
-  r.elems_handle = lv->elems_shared && lv->type == TY_POLY_ARRAY;
   r.elem_nil_marked = (unsigned)repr_elem_nil(r.elem, lv->nullable_int_elem & NIE_MARKED, lv->obj_elem_may_nil);
   r.elem_nil_reach = (unsigned)repr_elem_nil(r.elem, lv->nullable_int_elem & (NIE_MARKED | NIE_REACH), 0);
   repr_slot_storage(&r, lv);
@@ -1748,8 +1745,38 @@ static void repr_check_block_params(Compiler *c) {
   }
 }
 
+/* A String slot is the handle or bytes, and the rule marks every handle
+   (slot_take_string_handle): no local, global, instance variable or class
+   variable holds TY_STRBUF without the mark, which repr_of_slot reads as bytes. */
+static void repr_check_string_slots(Compiler *c) {
+  for (int si = 0; si < c->nscopes; si++) {
+    Scope *sc = &c->scopes[si];
+    for (int i = 0; i < sc->nlocals; i++) {
+      const LocalVar *lv = &sc->locals[i];
+      if (lv->type == TY_STRBUF && !lv->str_shared)
+        fprintf(stderr, "repr-check: conflict: scope %s local %s: slot string buffer without the handle mark\n",
+                sc->name ? sc->name : "?", lv->name ? lv->name : "?");
+    }
+  }
+  for (int g = 0; g < c->ngvars; g++)
+    if (c->gvars[g].type == TY_STRBUF && !c->gvars[g].str_shared)
+      fprintf(stderr, "repr-check: conflict: global %s: slot string buffer without the handle mark\n",
+              c->gvars[g].name ? c->gvars[g].name : "?");
+  for (int k = 0; k < c->nclasses; k++) {
+    const ClassInfo *ci = &c->classes[k];
+    for (int i = 0; i < ci->nivars; i++)
+      if (ci->ivar_types[i] == TY_STRBUF && !ci->ivar_str_shared[i])
+        fprintf(stderr, "repr-check: conflict: class %s ivar %s: slot string buffer without the handle mark\n",
+                ci->name ? ci->name : "?", ci->ivars[i] ? ci->ivars[i] : "?");
+    for (int i = 0; i < ci->ncvars; i++)
+      if (ci->cvar_types[i] == TY_STRBUF && !ci->cvar_str_shared[i])
+        fprintf(stderr, "repr-check: conflict: class %s class variable %s: slot string buffer without the handle mark\n",
+                ci->name ? ci->name : "?", ci->cvars[i] ? ci->cvars[i] : "?");
+  }
+}
+
 void repr_seal(Compiler *c) {
-  if (g_repr_check) repr_check_block_params(c);
+  if (g_repr_check) { repr_check_block_params(c); repr_check_string_slots(c); }
   repr_sealed_flag = 1;
   /* the String plan (share_plan.c), from the final facts and flags, asked
      as codegen will ask them: sealed */
@@ -1780,33 +1807,6 @@ int repr_local_shares(const Compiler *c, const Scope *s, const LocalVar *lv) {
   if (s->dm_subst_name && lv->name && sp_streq(lv->name, s->dm_subst_name)) return 0;
   return sh_may_hold(c, lv->type);
 }
-
-
-
-
-/* repr.h: a container type whose C form holds its Strings as `const char *`.
-   Under the one-String mode there is none: the typed containers hold the
-   handle (sp_strelem, string-one-repr-design.md). */
-int repr_typed_str_container(TyKind t) {
-  (void)t;
-  return 0;
-}
-
-int repr_str_literal_shares(Compiler *c, int node) {
-  if (node < 0) return 0;
-  NodeKind k = nt_kind(c->nt, node);
-  return (k == NK_ArrayNode || k == NK_HashNode) &&
-         repr_typed_str_container(c->ntype[node]) && comp_scope_of(c, node)->reachable;
-}
-
-
-
-
-
-
-
-
-
 
 /* ---- --dump-repr (#7501) ----
    One line per slot with the representation chosen for it, sorted, so the
@@ -1888,7 +1888,6 @@ Repr repr_of_cvar(const Compiler *c, int cid, int idx) {
   if (repr_may_nil(r.ty, 1)) r.may_nil = 1;
   if (r.ty == TY_STRBUF && ci->cvar_str_shared[idx]) r.handle = 1;
   r.share = r.handle;
-  r.elems_handle = (ci->cvar_elems_shared[idx] & ELEMS_POLY) && r.ty == TY_POLY_ARRAY;
   repr_set_class_facts(c, &r, r.ty);
   return r;
 }
@@ -1927,7 +1926,6 @@ static const char *repr_cell_name(int cell) {
   switch ((ReprCell)cell) {
   case RC_NONE:  return "";
   case RC_HEAP:  return " cell=heap";
-  case RC_BYREF: return " cell=byref";
   case RC_ALIAS: return " cell=alias";
   }
   return " cell=?";
@@ -1936,10 +1934,10 @@ static const char *repr_cell_name(int cell) {
 static void repr_dump_line(const Compiler *c, ReprLines *ls, const char *where, Repr r) {
   char ty[256], line[1024];
   repr_dump_ty(c, r.ty, ty, sizeof ty);
-  snprintf(line, sizeof line, "%s: %s ty=%s%s%s%s%s%s%s%s", where, repr_kind_name(r.kind), ty,
+  snprintf(line, sizeof line, "%s: %s ty=%s%s%s%s%s%s%s", where, repr_kind_name(r.kind), ty,
            r.handle ? " handle" : "", r.may_nil ? " may_nil" : "", r.dyn_cls ? " dyn_cls" : "",
            r.elem_nil_marked ? " elem_nil" : "", r.arr_or_nil ? " arr_or_nil" : "",
-           repr_cell_name(r.cell), r.volatile_str ? " volatile" : "");
+           repr_cell_name(r.cell));
   if (ls->n == ls->cap) {
     ls->cap = ls->cap ? ls->cap * 2 : 64;
     ls->v = realloc(ls->v, (size_t)ls->cap * sizeof *ls->v);

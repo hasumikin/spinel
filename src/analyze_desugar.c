@@ -2329,12 +2329,9 @@ int desugar_fiber_prepended_init(Compiler *c) {
 /* A receiverless `include M` / `prepend M` of constants: the mixin
    statement a singleton-class body can hold. */
 static int scm_mixin_stmt(const NodeTable *nt, int st) {
-  if (nt_kind(nt, st) != NK_CallNode || nt_ref(nt, st, "block") >= 0 || nt_ref(nt, st, "receiver") >= 0) return 0;
-  const char *nm = nt_str(nt, st, "name");
-  if (!nm || (!sp_streq(nm, "prepend") && !sp_streq(nm, "include"))) return 0;
-  int args = nt_ref(nt, st, "arguments");
-  int an = 0; const int *av = args >= 0 ? nt_arr(nt, args, "arguments", &an) : NULL;
-  if (an < 1 || !av) return 0;
+  int prep; const int *av;
+  int an = mixin_stmt_args(nt, st, &prep, &av);
+  if (an < 1 || nt_ref(nt, st, "block") >= 0) return 0;
   for (int a = 0; a < an; a++)
     if (nt_kind(nt, av[a]) != NK_ConstantReadNode && nt_kind(nt, av[a]) != NK_ConstantPathNode) return 0;
   return 1;
@@ -5385,6 +5382,23 @@ static int cvb_split(Compiler *c, int id, const char *nm, const int *bval, int n
   }
   return 1;
 }
+/* Is nm a class method of some builtin class its instances do not answer
+   (cvb_split's arms, before the classes the value can be narrow them)?
+   The tables are fixed, so the answer is kept by name. */
+static int cvb_name_may_split(const char *nm) {
+  enum { CAP = 1 << 12 };
+  static struct { char *nm; signed char may; } memo[CAP];
+  static int nmemo;
+  unsigned h = sp_strhash(nm) & (CAP - 1);
+  for (; memo[h].nm; h = (h + 1) & (CAP - 1))
+    if (sp_streq(memo[h].nm, nm)) return memo[h].may;
+  int may = 0;
+  const BuiltinClass *r = NULL;
+  for (int i = 0; !may && (r = builtin_class_at(i)); i++)
+    may = r->name && builtin_cmethod_known(r->name, nm) && !builtin_instance_method_known(r->name, nm);
+  if (nmemo < CAP / 2) { memo[h].nm = strdup(nm); memo[h].may = (signed char)may; nmemo++; }
+  return may;
+}
 int desugar_class_value_builtin_cmethod(Compiler *c) {
   NodeTable *nt = (NodeTable *)c->nt;
   int bval[32], nb = -1, changed = 0, n0 = nt->count;
@@ -5393,6 +5407,11 @@ int desugar_class_value_builtin_cmethod(Compiler *c) {
     const char *nm = nt_str(nt, id, "name");
     int recv = nt_ref(nt, id, "receiver");
     if (!nm || recv < 0) continue;
+    /* what cvb_split turns down by the tree and the name alone, ahead of
+       the receiver's inference: asked of every call each round, that was
+       most of this pass */
+    if (nt_kind(nt, recv) != NK_LocalVariableReadNode || nt_ref(nt, id, "block") >= 0 || nt_safe_nav(nt, id) ||
+        !cvb_name_may_split(nm)) continue;
     if (infer_type(c, recv) != TY_POLY) continue;
     if (nb < 0) nb = cvb_value_builtins(c, bval, 32);
     if (nb == 0) break;
@@ -6054,13 +6073,11 @@ static int engine_object_mixes_in_scan(NodeTable *nt) {
     if (nt_kind(nt, id) != NK_CallNode) continue;
     const char *nm = nt_str(nt, id, "name");
     if (!nm) continue;
-    int mix = sp_streq(nm, "include") || sp_streq(nm, "prepend");
+    int mix = is_include_name(nm) || is_prepend_name(nm);
     if (!mix && is_send_family(nm)) {
-      int ac = 0; const int *av = nt_arr(nt, nt_ref(nt, id, "arguments"), "arguments", &ac);
-      const char *s = ac < 1 ? NULL : nt_kind(nt, av[0]) == NK_SymbolNode ? nt_str(nt, av[0], "value") :
-                      nt_kind(nt, av[0]) == NK_StringNode ? nt_str(nt, av[0], "content") : NULL;
+      const char *s = call_sent_name(nt, id, NULL);
       /* a computed method name could be either */
-      mix = ac < 1 || !s || sp_streq(s, "include") || sp_streq(s, "prepend");
+      mix = !s || is_include_name(s) || is_prepend_name(s);
     }
     if (!mix) continue;
     int r = nt_ref(nt, id, "receiver");
@@ -6127,12 +6144,13 @@ static const char *engine_body_class(NodeTable *nt, int stmt) {
   return NULL;
 }
 
-static int me_record_defines(const NodeTable *nt, const char *cls, const char *m, int in, int *is_data);
-static int engine_method_absent(NodeTable *nt, const char *cls, const char *m, int in, int depth) {
+static int me_record_defines(Compiler *c, const char *cls, const char *m, int in, int *is_data);
+static int engine_method_absent(Compiler *c, const char *cls, const char *m, int in, int depth) {
+  NodeTable *nt = (NodeTable *)c->nt;
   if (builtin_method_known(cls, m) || me_body_defines(nt, cls, m, in)) return 0;
   /* a Struct's or Data's members, the defs in its block, and the methods
      Struct or Data gives every instance (each, with ...) */
-  int data = 0, rec = me_record_defines(nt, cls, m, in, &data);
+  int data = 0, rec = me_record_defines(c, cls, m, in, &data);
   /* (a record the fold cannot read leaves the question to the steps below) */
   if (rec > 0) return 0;
   if (data >= 0) {
@@ -6153,14 +6171,14 @@ static int engine_method_absent(NodeTable *nt, const char *cls, const char *m, i
     const char *nm = class_def_name(nt, id);
     if (!class_def_opens_frame(nt, id) || !nm || !sp_streq(nm, cls)) continue;
     int sc = class_def_super(nt, id), bn = 0;
-    if (sc >= 0) a = nt_kind(nt, sc) == NK_ConstantReadNode ? engine_method_absent(nt, nt_str(nt, sc, "name"), m, in, depth + 1) : -1;
+    if (sc >= 0) a = nt_kind(nt, sc) == NK_ConstantReadNode ? engine_method_absent(c, nt_str(nt, sc, "name"), m, in, depth + 1) : -1;
     const int *b = nt_arr(nt, class_def_body(nt, id), "body", &bn);
     for (int i = 0; i < bn && a > 0; i++) {
       const char *n = nt_kind(nt, b[i]) == NK_CallNode && nt_ref(nt, b[i], "receiver") < 0 ? nt_str(nt, b[i], "name") : NULL;
       if (!n || (!sp_streq(n, "include") && !sp_streq(n, "prepend"))) continue;
       int ac = 0; const int *av = nt_arr(nt, nt_ref(nt, b[i], "arguments"), "arguments", &ac);
       for (int k = 0; k < ac && a > 0; k++)
-        a = nt_kind(nt, av[k]) == NK_ConstantReadNode ? engine_method_absent(nt, nt_str(nt, av[k], "name"), m, in, depth + 1) : -1;
+        a = nt_kind(nt, av[k]) == NK_ConstantReadNode ? engine_method_absent(c, nt_str(nt, av[k], "name"), m, in, depth + 1) : -1;
     }
   }
   return a;
@@ -6217,11 +6235,10 @@ static int engine_surely_top_stmt(Compiler *c, int id) {
    or `x` or names no literal; a removal of some other constant
    (`Object.send(:remove_const, :Zork)`) leaves them alone. */
 static int engine_removes_const(NodeTable *nt, int id, const char *h, const char *x) {
-  const char *nm = nt_str(nt, id, "name");
-  if (!nm) return 0;
-  int ac = 0; const int *av = nt_arr(nt, nt_ref(nt, id, "arguments"), "arguments", &ac);
-  int via = is_send_family(nm) && ac >= 1 && is_remove_const_name(vis_arg_name(nt, av[0]));
-  if (!via && !is_remove_const_name(nm)) return 0;
+  int ac = 0, via = 0;
+  const int *av = call_args(nt, id, &ac);
+  const char *nm = call_sent_name(nt, id, &via);
+  if (!nm || !is_remove_const_name(nm)) return 0;
   const char *gone = ac > via ? vis_arg_name(nt, av[via]) : NULL;
   return !gone || sp_streq(gone, h) || sp_streq(gone, x);
 }
@@ -6306,12 +6323,11 @@ static int engine_leaf_unwritten(NodeTable *nt, const char *leaf) {
       if (sp_streq(l ? l + 1 : wn, leaf)) return 0;
       continue;
     }
-    const char *nm = nt_kind(nt, id) == NK_CallNode ? nt_str(nt, id, "name") : NULL;
-    if (!nm) continue;
-    int ac = 0; const int *av = nt_arr(nt, nt_ref(nt, id, "arguments"), "arguments", &ac);
-    const char *a0 = ac >= 1 ? vis_arg_name(nt, av[0]) : NULL;
-    int via = is_send_family(nm) && a0 && is_const_set_name(a0);   /* (a send of a run-time name: not taken for one, as engine_removes_const) */
-    if (!via && !is_const_set_name(nm)) continue;
+    if (nt_kind(nt, id) != NK_CallNode) continue;
+    int ac = 0, via = 0;
+    const int *av = call_args(nt, id, &ac);
+    const char *nm = call_sent_name(nt, id, &via);   /* (a send of a run-time name: not taken for one, as engine_removes_const) */
+    if (!nm || !is_const_set_name(nm)) continue;
     const char *set = ac > via ? vis_arg_name(nt, av[via]) : NULL;
     if (!set || sp_streq(set, leaf)) return 0;
   }
@@ -6406,7 +6422,8 @@ static int me_top_stmt(const NodeTable *nt, int id) {
   }
   return 0;
 }
-static int me_record_defines(const NodeTable *nt, const char *cls, const char *m, int in, int *is_data) {
+static int me_record_defines(Compiler *c, const char *cls, const char *m, int in, int *is_data) {
+  const NodeTable *nt = c->nt;
   int found = 0, unknown = 0, rec = 0, data = -1;
   for (int id = 0; id < nt->count; id++) {
     if (nt_kind(nt, id) != NK_ConstantWriteNode || subtree_has(nt, in, id)) continue;
@@ -6423,6 +6440,21 @@ static int me_record_defines(const NodeTable *nt, const char *cls, const char *m
       NodeKind ak = nt_kind(nt, av[a]);
       /* (keyword_init: and the like) */
       if (ak == NK_KeywordHashNode) continue;
+      /* `Struct.new(*MEMS)`: the names the splat's list resolves to, as
+         register_struct_members reads them (a list it cannot read is
+         refused there) */
+      if (ak == NK_SplatNode) {
+        const char *syms[128];
+        int se = nt_ref(nt, av[a], "expression");
+        int sn = se >= 0 ? resolve_symbol_list(c, se, syms, 128, 0) : -1;
+        if (sn < 0) { unknown = 1; continue; }
+        for (int k = 0; k < sn; k++) {
+          size_t sl = syms[k] ? strlen(syms[k]) : 0;
+          if (syms[k] && (sp_streq(syms[k], m) || (!data && !strncmp(syms[k], m, sl) && sp_streq(m + sl, "="))))
+            found = 1;
+        }
+        continue;
+      }
       const char *v = ak == NK_SymbolNode ? nt_str(nt, av[a], "value") : ak == NK_StringNode ? nt_str(nt, av[a], "content") : NULL;
       if (!v) { unknown = 1; continue; }
       size_t vl = strlen(v);
@@ -6449,10 +6481,11 @@ static int me_record_defines(const NodeTable *nt, const char *cls, const char *m
    `cls` outside guard `in`, its ancestors not asked? 0 present, 1 absent, -1
    not known: a class of the runtime's, whose own methods are not listed per
    class here, or one the program does not define. */
-static int engine_method_own_absent(NodeTable *nt, const char *cls, const char *m, int in) {
+static int engine_method_own_absent(Compiler *c, const char *cls, const char *m, int in) {
+  NodeTable *nt = (NodeTable *)c->nt;
   if (me_body_defines(nt, cls, m, in)) return 0;
   /* (a Struct's or Data's members and the defs in its block are its own) */
-  if (me_record_defines(nt, cls, m, in, NULL) > 0) return 0;
+  if (me_record_defines(c, cls, m, in, NULL) > 0) return 0;
   if (is_builtin_class_name(cls) || is_builtin_module_name(cls) || builtin_class_id(cls)) return -1;
   return me_leaf_defined(nt, cls) ? 1 : -1;
 }
@@ -6472,8 +6505,8 @@ static int engine_absent(Compiler *c, int e, int in) {
     int ok = ac == 1 || own || (ac == 2 && nt_kind(nt, av[1]) == NK_TrueNode);
     const char *m = !ok ? NULL : nt_kind(nt, av[0]) == NK_SymbolNode ? nt_str(nt, av[0], "value") :
                     nt_kind(nt, av[0]) == NK_StringNode ? nt_str(nt, av[0], "content") : NULL;
-    int a = !cls || !m ? -1 : own ? engine_method_own_absent(nt, cls, m, in) :
-            builtin_object_method_known(m) ? 0 : engine_method_absent(nt, cls, m, in, 0);
+    int a = !cls || !m ? -1 : own ? engine_method_own_absent(c, cls, m, in) :
+            builtin_object_method_known(m) ? 0 : engine_method_absent(c, cls, m, in, 0);
     /* (a def elsewhere could reach the class through a mixin; not asked of the own bodies alone) */
     if (a > 0 && !own)
       for (int id = 0; id < nt->count; id++)
@@ -9044,6 +9077,11 @@ int desugar_array_at(Compiler *c) {
         /* a bare `private :at` reopening with no redefinition (K-028,
            kilau docs/CATALOG.md), same reason as desugar_array_first_last */
         comp_method_vis_declared(c, k, "at", NULL) != SP_VIS_PUBLIC) user_at = 1;
+  /* a class method `at` of the program's own (Stamp.at): a receiver that
+     is boxed, or not typed yet, may hold that Class at run time */
+  int user_cat = 0;
+  for (int k = 0; k < c->nclasses && !user_cat; k++)
+    if (comp_cmethod_in_chain(c, k, "at", NULL) >= 0) user_cat = 1;
   if (!user_at)
   NT_FOREACH_KIND(nt, NK_CallNode, id) {
     const char *nm = nt_str(nt, id, "name");
@@ -9059,6 +9097,7 @@ int desugar_array_at(Compiler *c) {
     TyKind rt = infer_type(c, recv);
     /* Time#at and a Struct's own member reader are different methods */
     if (rt == TY_TIME || rt == TY_CLASS || ty_is_object(rt)) continue;
+    if (user_cat && !ty_is_array(rt)) continue;
     /* a call or a local not typed yet may answer a Class (`klass.at(s)`,
        Time's maker; a block parameter over [Time, Stamp]): a later round,
        with its type, decides */
@@ -11792,6 +11831,18 @@ int desugar_value_callable_forwards(Compiler *c) {
     else if (ty_is_hash(rt)) wrap_pair = 0;   /* each_key/each_value: the bare key/value */
 
     int base = nt->count;
+    /* The hoist and the nil test below rewrite the `&` node in place, and
+       the arms of a send share their send's (dyn_send_arms): this arm takes
+       a copy of its own, or every other arm read the temp only this arm
+       sets -- `send(m, &blk)` reached `any(&blk)` with no block. */
+    if ((hoist || fill_nilable || blk_nilable) && nt_str(nt, id, "dyn_name") &&
+        nt_ref(nt, id, "block") == blk) {
+      int cl = nt_clone_subtree(nt, blk);
+      if (cl < 0) continue;
+      nt_node_set_ref(nt, id, "block", cl);
+      blk = cl;
+      ex = nt_ref(nt, blk, "expression");
+    }
     /* (the temps ahead of the call, wrapped round it at the end of the
        round: the exits below that skip the wrap are node-table exhaustion,
        where nt_new_node aborts, so none is taken with temps pending) */
@@ -12535,13 +12586,49 @@ static int def_shape(const NodeTable *nt, int id) {
   if (fwd_subtree_uses_yield_or_block(nt, id)) sh |= 4;
   return sh;
 }
-static int def_shape_by_name(const NodeTable *nt, const char *name) {
-  int shape = -1;
-  for (int id = 0; id < nt->count; id++) {
-    if (!fwd_node_is(nt, id, "DefNode")) continue;
-    const char *nm = nt_str(nt, id, "name");
-    if (!nm || !sp_streq(nm, name)) continue;
-    int sh = def_shape(nt, id);
+/* The forwarding lowering's pass context: every def by name, sorted once (a forwarder's rewrite changes a def's
+   parameters, never the set of defs), and what a module's `super` reaches, asked of the load record once per
+   (module, name). */
+typedef struct { const char *name; int def; } FwdNamed;
+typedef struct { int holder; const char *name; int bits, nreach, reader, opaque; int *reach; } FwdSuper;
+typedef struct FwdCtx { Compiler *c; const NodeTable *nt; FwdNamed *named; int nnamed; FwdSuper *sup; int nsup, csup; } FwdCtx;
+static int fwd_named_cmp(const void *a, const void *b) {
+  const FwdNamed *p = a, *q = b;
+  int d = strcmp(p->name, q->name);
+  return d ? d : (p->def > q->def) - (p->def < q->def);
+}
+static void fwd_ctx_init(FwdCtx *fx, Compiler *c) {
+  const NodeTable *nt = c->nt;
+  int cap = 0;
+  memset(fx, 0, sizeof *fx);
+  fx->c = c; fx->nt = nt;
+  NT_FOREACH_KIND(nt, NK_DefNode, d) {
+    const char *nm = nt_str(nt, d, "name");
+    if (!nm) continue;
+    if (fx->nnamed == cap) {
+      cap = cap ? cap * 2 : 64;
+      if (!(fx->named = realloc(fx->named, sizeof *fx->named * (size_t)cap))) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    }
+    fx->named[fx->nnamed++] = (FwdNamed){ nm, d };
+  }
+  if (fx->nnamed) qsort(fx->named, (size_t)fx->nnamed, sizeof *fx->named, fwd_named_cmp);
+}
+static void fwd_ctx_free(FwdCtx *fx) {
+  for (int i = 0; i < fx->nsup; i++) free(fx->sup[i].reach);
+  free(fx->sup); free(fx->named);
+}
+/* the defs named `name`: fx->named[*lo .. *hi) */
+static void fwd_named_range(const FwdCtx *fx, const char *name, int *lo, int *hi) {
+  int a = 0, b = fx->nnamed;
+  while (a < b) { int m = (a + b) / 2; if (strcmp(fx->named[m].name, name) < 0) a = m + 1; else b = m; }
+  for (b = a; b < fx->nnamed && !strcmp(fx->named[b].name, name); b++) {}
+  *lo = a; *hi = b;
+}
+static int def_shape_by_name(const FwdCtx *fx, const char *name) {
+  int lo, hi, shape = -1;
+  fwd_named_range(fx, name, &lo, &hi);
+  for (int k = lo; k < hi; k++) {
+    int sh = def_shape(fx->nt, fx->named[k].def);
     if (sh < 0) continue;
     if (shape >= 0 && shape != sh) return -2;
     shape = sh;
@@ -12552,23 +12639,20 @@ static int def_shape_by_name(const NodeTable *nt, const char *name) {
    receiver whose class is not known here may be any of them, and the
    anonymous `*, **, &` passes each exactly what the call had: an empty
    splat and an empty `**` pass nothing to a def that takes neither. */
-static int def_shape_union_by_name(const NodeTable *nt, const char *name) {
-  int shape = -1;
-  for (int id = 0; id < nt->count; id++) {
-    if (!fwd_node_is(nt, id, "DefNode")) continue;
-    const char *nm = nt_str(nt, id, "name");
-    if (!nm || !sp_streq(nm, name)) continue;
-    int sh = def_shape(nt, id);
+static int def_shape_union_by_name(const FwdCtx *fx, const char *name) {
+  int lo, hi, shape = -1;
+  fwd_named_range(fx, name, &lo, &hi);
+  for (int k = lo; k < hi; k++) {
+    int sh = def_shape(fx->nt, fx->named[k].def);
     if (sh < 0) continue;
     shape = shape < 0 ? sh : (shape | sh);
   }
   return shape;
 }
-static int fwd_any_def_named(const NodeTable *nt, const char *name) {
-  for (int id = 0; id < nt->count; id++)
-    if (fwd_node_is(nt, id, "DefNode") && nt_str(nt, id, "name") &&
-        sp_streq(nt_str(nt, id, "name"), name)) return 1;
-  return 0;
+static int fwd_any_def_named(const FwdCtx *fx, const char *name) {
+  int lo, hi;
+  fwd_named_range(fx, name, &lo, &hi);
+  return hi > lo;
 }
 static void fwd_key_add(char *key, size_t cap, const char *seg) {
   size_t n = strlen(key);
@@ -13262,44 +13346,22 @@ int desugar_extend_enumerable(Compiler *c, HostStep *h) {
   return changed;
 }
 
-/* The shape of instance method `name` as the class `ref` names from
-   namespace `ctx` (or its nearest superclass defining it) has it. Classes
-   are matched by namespace and name, before any scope exists. */
-static int fwd_class_method_shape(const NodeTable *nt, const char *ctx, int ref,
-                                  const char *refname, const char *name) {
-  char at[512], key[512];
-  snprintf(at, sizeof at, "%s", ctx);
-  for (int depth = 0; depth < 16; depth++) {
-    char found[512];
-    if (!fwd_resolve_class(nt, at, ref, refname, found, sizeof found)) return -1;
-    const char *cls = ref >= 0 ? nt_str(nt, ref, "name") : refname;
-    int shape = -1, next = -1, next_cls = -1;
-    for (int id = 0; id < nt->count; id++) {
-      if (!class_def_is_class(nt, id)) continue;
-      const char *cn = class_def_name(nt, id);
-      if (!cn || !sp_streq(cn, cls)) continue;
-      key[0] = '\0';
-      fwd_ns_key(nt, id, key, sizeof key);
-      if (!sp_streq(key, found)) continue;
-      if (next < 0 && class_def_super(nt, id) >= 0) { next = class_def_super(nt, id); next_cls = id; }
-      int bn = 0; const int *bv = nt_arr(nt, class_def_body(nt, id), "body", &bn);
-      for (int k = 0; k < bn; k++) {
-        int dk = fwd_body_def(nt, bv[k]);
-        if (dk < 0 || nt_ref(nt, dk, "receiver") >= 0) continue;
-        const char *dn = nt_str(nt, dk, "name");
-        if (!dn || !sp_streq(dn, name)) continue;
-        int sh = def_shape(nt, dk);
-        if (sh < 0 || (shape >= 0 && sh != shape)) return -2;
-        shape = sh;
-      }
+/* The shape of instance method `name` that class cls (the record's) reaches: its own def when own, else the first
+   owner after cls's own def (the `super` of cls's def). The record's chain is read: cls's prepends, own, includes,
+   then its superclass's, with the modules mixed in; a builtin's method or an owner the record cannot follow is
+   -1. A def that still takes `...` says nothing yet (-2). */
+static int fwd_class_method_shape(FwdCtx *fx, int cls, int own, const char *name) {
+  int *reach, nreach, reader, opaque;
+  int bits = elab_class_super_owner(fx->c, cls, own, name, &reach, &nreach, &reader, &opaque);
+  int shape = -1;
+  if (bits == (1 << MX_PROGRAM) && !opaque && !reader)
+    for (int k = 0; k < nreach; k++) {
+      int sh = def_shape(fx->nt, reach[k]);
+      if (sh < 0 || (shape >= 0 && sh != shape)) { shape = -2; break; }
+      shape = sh;
     }
-    if (shape >= 0) return shape;
-    if (next < 0) return -1;
-    at[0] = '\0';
-    fwd_lex_ctx(nt, next_cls, at, sizeof at);
-    ref = next; refname = NULL;
-  }
-  return -1;
+  free(reach);
+  return shape;
 }
 /* The ClassNode whose body holds `def` directly or under a visibility call,
    or -1. */
@@ -13313,14 +13375,15 @@ static int fwd_enclosing_class(const NodeTable *nt, int def) {
    and a positional rest when no class defines one. A class-value `new`
    passing `**` has no arm for a Struct or Data class, so the keyword
    channel is refused where one could be the receiver. */
-static int fwd_class_value_new_shape(const NodeTable *nt) {
-  int sh = def_shape_by_name(nt, "initialize");
-  if (sh == -1 && !fwd_any_def_named(nt, "initialize")) return 1;
+static int fwd_class_value_new_shape(const FwdCtx *fx) {
+  const NodeTable *nt = fx->nt;
+  int sh = def_shape_by_name(fx, "initialize");
+  if (sh == -1 && !fwd_any_def_named(fx, "initialize")) return 1;
   if (sh != -2) return sh;
-  int shape = 1;
-  for (int id = 0; id < nt->count; id++) {
-    const char *nm = nt_str(nt, id, "name");
-    int dsh = fwd_node_is(nt, id, "DefNode") && nm && sp_streq(nm, "initialize") ? def_shape(nt, id) : -1;
+  int shape = 1, lo, hi;
+  fwd_named_range(fx, "initialize", &lo, &hi);
+  for (int k = lo; k < hi; k++) {
+    int dsh = def_shape(nt, fx->named[k].def);
     if (dsh >= 0) shape |= dsh;
   }
   if (!(shape & 2)) return shape;
@@ -13447,12 +13510,61 @@ static int fwd_record_class_named(const NodeTable *nt, const char *name) {
   }
   return 0;
 }
-static int fwd_target_shape(const NodeTable *nt, int def, int call, int is_super) {
+/* A module's `super`'s memo: what the record says it reaches, asked once per (module, name) */
+static const FwdSuper *fwd_super_owners(FwdCtx *fx, int holder, const char *name) {
+  for (int i = 0; i < fx->nsup; i++)
+    if (fx->sup[i].holder == holder && !strcmp(fx->sup[i].name, name)) return &fx->sup[i];
+  if (fx->nsup == fx->csup) {
+    fx->csup = fx->csup ? fx->csup * 2 : 32;
+    if (!(fx->sup = realloc(fx->sup, sizeof *fx->sup * (size_t)fx->csup))) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  }
+  FwdSuper *m = &fx->sup[fx->nsup++];
+  *m = (FwdSuper){ holder, name, 0, 0, 0, 0, NULL };
+  m->bits = elab_module_super_owners(fx->c, holder, name, &m->reach, &m->nreach, &m->reader, &m->opaque);
+  return m;
+}
+/* The shape of the `super` in module `holder`'s method `name`. It reaches the method of whatever follows the module at
+   each position the module has (an includer's, a prepender's, an extender's): the load record says which.
+     - Every position reaches a def of the program's, or none exists: the channels of the defs reached, so the
+       keywords a caller passes stay keywords. Left to the __fwd_N model, a mixin's `def process(...) = super` took
+       one slot per argument a caller passed, and handed `process("index")` on as `process("index", 0, 0)` with
+       keywords as positionals.
+     - Every position reaches a builtin's method: the __fwd_N model, the one shape a super into a builtin is
+       emitted in.
+     - Positions of both kinds, or one the record cannot read (a module mixed onto an object, a superclass it
+       does not know): see below. */
+static int fwd_module_super_shape(FwdCtx *fx, int holder, const char *name) {
+  const FwdSuper *m = fwd_super_owners(fx, holder, name);
+  int bi = m->bits & (1 << MX_BUILTIN), pr = m->bits & (1 << MX_PROGRAM);
+  int other = m->bits & ((1 << MX_NONE) | (1 << MX_UNKNOWN));
+  if (bi && !pr && !other) return -1;
+  if (!bi && !other) {
+    if (!pr || m->opaque) return def_shape_union_by_name(fx, name);
+    /* ...the defs the positions reach first, not every def of the name. A def that still takes `...` says
+       nothing yet, and then the name's defs are the answer */
+    int shape = m->reader ? 0 : -1;
+    for (int k = 0; k < m->nreach; k++) {
+      int sh = def_shape(fx->nt, m->reach[k]);
+      if (sh < 0) return def_shape_union_by_name(fx, name);
+      shape = shape < 0 ? sh : (shape | sh);
+    }
+    return shape >= 0 ? shape : def_shape_union_by_name(fx, name);
+  }
+  /* Neither shape is right for a position that reaches a builtin and another that reaches a def of the program's:
+     the union breaks the builtin position (a super into a builtin with a splat has no arm), the __fwd_N model
+     breaks the program one (keywords become positionals). The name rule below keeps what the lowering answered
+     before the record was read; it goes when a super into a builtin takes the union shape. */
+  if (builtin_object_method_known(name) || builtin_name_below_object(name) ||
+      is_initialize_name(name) || is_method_missing_name(name)) return -1;
+  return def_shape_union_by_name(fx, name);
+}
+static int fwd_target_shape(FwdCtx *fx, int def, int call, int is_super) {
+  const NodeTable *nt = fx->nt;
   const char *name = is_super ? nt_str(nt, def, "name") : nt_str(nt, call, "name");
   if (!name) return -1;
   if (!is_super && !sp_streq(name, "new")) {
-    if (!fwd_any_def_named(nt, name)) return FWD_BUILTIN;
-    int sh = def_shape_union_by_name(nt, name);
+    if (!fwd_any_def_named(fx, name)) return FWD_BUILTIN;
+    int sh = def_shape_union_by_name(fx, name);
     /* every def of the name a `...` forwarder (io-event's Timers::Handle
        `def call(...) = @block.call(...)`, its own name): a name that takes
        anything (a proc's call, a send) is forwarded as the builtin's, the
@@ -13464,7 +13576,6 @@ static int fwd_target_shape(const NodeTable *nt, int def, int call, int is_super
   }
   int recv = is_super ? -1 : nt_ref(nt, call, "receiver");
   int cls = fwd_enclosing_class(nt, def);
-  char ctx[512] = "";
   /* a `new` the class defines itself takes the arguments (#5405, #5410);
      a forwarder in `class << self` belongs to the class around that body */
   if (!is_super && (recv < 0 || fwd_node_is(nt, recv, "SelfNode"))) {
@@ -13481,39 +13592,25 @@ static int fwd_target_shape(const NodeTable *nt, int def, int call, int is_super
   }
   if (is_super) {
     if (nt_ref(nt, def, "receiver") >= 0) return -1;
-    /* A module's `super` reaches the method of each class including it,
-       which may be any def of the name: every channel one of them takes.
-       Left to the __fwd_N model, a mixin's `def process(...) = super` took
-       one slot per argument a caller passed, and handed `process("index")`
-       on as `process("index", 0, 0)` with keywords as positionals. A name a
-       builtin answers (a mixin's `to_s(...)`, `initialize`) may reach the
-       builtin, which keeps that model. */
     if (cls < 0) {
       int holder = fwd_lex_parent(nt, def);
-      if (holder < 0 || nt_kind(nt, holder) != NK_ModuleNode ||
-          builtin_object_method_known(name) || builtin_name_below_object(name) ||
-          sp_streq(name, "initialize") || sp_streq(name, "respond_to_missing?") ||
-          sp_streq(name, "method_missing")) return -1;
-      return def_shape_union_by_name(nt, name);
+      if (holder < 0 || nt_kind(nt, holder) != NK_ModuleNode) return -1;
+      return fwd_module_super_shape(fx, holder, name);
     }
-    fwd_lex_ctx(nt, cls, ctx, sizeof ctx);
-    return fwd_class_method_shape(nt, ctx, class_def_super(nt, cls), NULL, name);
+    return fwd_class_method_shape(fx, elab_header_class(fx->c, cls, NULL, NULL), 0, name);
   }
   if (recv < 0 || fwd_node_is(nt, recv, "SelfNode")) {
     if (nt_ref(nt, def, "receiver") < 0 || cls < 0) return -1;
-    fwd_ns_key(nt, cls, ctx, sizeof ctx);
-    return fwd_class_method_shape(nt, ctx, -1, class_def_name(nt, cls),
-                                  "initialize");
+    return fwd_class_method_shape(fx, elab_header_class(fx->c, cls, NULL, NULL), 1, "initialize");
   }
   if (fwd_node_is(nt, recv, "ConstantReadNode") || fwd_node_is(nt, recv, "ConstantPathNode")) {
-    fwd_lex_ctx(nt, def, ctx, sizeof ctx);
-    int sh = fwd_class_method_shape(nt, ctx, recv, NULL, "initialize");
+    int sh = fwd_class_method_shape(fx, elab_class_ref_at(fx->c, recv, NULL), 1, "initialize");
     /* a Struct or Data class with no initialize of its own takes both
        channels; left to the __fwd_N model, `Pair.new(...)` was refused */
     if (sh == -1 && fwd_record_class_named(nt, nt_str(nt, recv, "name"))) return 3;
     return sh;
   }
-  return fwd_class_value_new_shape(nt);
+  return fwd_class_value_new_shape(fx);
 }
 static void fwd_copy_loc(NodeTable *nt, int id, int like) {
   nt_node_set_int(nt, id, "node_line", nt_int(nt, like, "node_line", 0));
@@ -13570,6 +13667,7 @@ static int anon_fwd_rewrite(Compiler *c, int node, int parent, unsigned anon) {
     nt_node_set_int(nt, rd, "depth", 0);
     nt_node_set_ref(nt, node, field, rd);
     comp_grow_node_arrays(c);
+    c->nscope[rd] = c->nscope[node]; c->node_cbody[rd] = c->node_cbody[node];   /* (where it reads: the walk's, or after it) */
     return 1;
   }
   int changed = 0;
@@ -14484,7 +14582,7 @@ static int fwd_waits_on_forwarder(const NodeTable *nt, int def, int hi) {
 }
 /* One pass over the `...` forwarders, in source order. With `wait`, one
    whose target is still a `...` forwarder is left for a later pass. */
-static int fwd_rest_callee_pass(Compiler *c, int wait) {
+static int fwd_rest_callee_pass(Compiler *c, FwdCtx *fx, int wait) {
   NodeTable *nt = (NodeTable *)c->nt;
   int changed = 0;
   int n0 = nt->count;
@@ -14534,7 +14632,7 @@ static int fwd_rest_callee_pass(Compiler *c, int wait) {
       const char *cn = is_super ? dname : nt_str(nt, id, "name");
       int is_new = cn && sp_streq(cn, "new");
       if (is_new) cn = "initialize";
-      int sh = fwd_target_shape(nt, def, id, is_super);
+      int sh = fwd_target_shape(fx, def, id, is_super);
       if (sh == FWD_BUILTIN) {
         int arity = fwd_fixed_call_arity(nt, dname);
         int via = cn && (sp_streq(cn, "__send__") || sp_streq(cn, "send") ||
@@ -14621,7 +14719,7 @@ static int fwd_rest_callee_pass(Compiler *c, int wait) {
       nt_node_set_ref(nt, pn, "block", bp);
       /* the per-node arrays grow over the new parameters, as below */
       comp_grow_node_arrays(c);
-      for (int j = pbase; j < nt->count; j++) c->nscope[j] = c->nscope[def];
+      for (int j = pbase; j < nt->count; j++) { c->nscope[j] = elab_def_scope_of(c, def); c->node_cbody[j] = c->node_cbody[def]; }
       changed = 1;
       continue;
     }
@@ -14661,9 +14759,12 @@ static int fwd_rest_callee_pass(Compiler *c, int wait) {
       if (bp < 0) continue;
       nt_node_set_ref(nt, pn, "block", bp);
     }
+    /* the parameters stand in the method's scope */
+    comp_grow_node_arrays(c);
+    for (int j = base; j < nt->count; j++) { c->nscope[j] = elab_def_scope_of(c, def); c->node_cbody[j] = c->node_cbody[def]; }
     /* callee(x, ...) -> callee(x, *, **, &) */
     for (int k = 0; k < ncalls; k++) {
-      int call = calls[k];
+      int call = calls[k], cbase = nt->count;
       if (fwd_node_is(nt, call, "ForwardingSuperNode")) {
         int line = (int)nt_int(nt, call, "node_line", 0);
         int file = (int)nt_int(nt, call, "node_file", 0);
@@ -14720,9 +14821,10 @@ static int fwd_rest_callee_pass(Compiler *c, int wait) {
         nt_node_set_ref(nt, ba, "expression", -1);
         nt_node_set_ref(nt, call, "block", ba);
       }
+      /* ...and the call's arguments in the call's */
+      comp_grow_node_arrays(c);
+      for (int j = cbase; j < nt->count; j++) { c->nscope[j] = c->nscope[call]; c->node_cbody[j] = c->node_cbody[call]; }
     }
-    comp_grow_node_arrays(c);
-    for (int j = base; j < nt->count; j++) c->nscope[j] = c->nscope[def];
     changed = 1;
   }
   free(calls);
@@ -14738,8 +14840,11 @@ static int fwd_rest_callee_pass(Compiler *c, int wait) {
    yields), and is read as before, from the defs that do say. */
 int desugar_forwarding_to_rest_callee_at(Compiler *c, LowerCtx *lc, int id) {
   int changed = 0;
-  while (fwd_rest_callee_pass(c, 1)) changed = 1;
-  while (fwd_rest_callee_pass(c, 0)) changed = 1;
+  FwdCtx fx;
+  fwd_ctx_init(&fx, c);
+  while (fwd_rest_callee_pass(c, &fx, 1)) changed = 1;
+  while (fwd_rest_callee_pass(c, &fx, 0)) changed = 1;
+  fwd_ctx_free(&fx);
   return changed;
 }
 
@@ -15795,15 +15900,6 @@ static int bi_opens(const NodeTable *nt, int id, const char *ns, const char *lea
   return 1;
 }
 
-/* the arguments of a body's `include` statement st (`prepend` with
-   want_prepend): their count, 0 for another statement */
-static int bi_mixin_args(const NodeTable *nt, int st, int want_prepend, const int **av) {
-  const char *mx = nt_kind(nt, st) == NK_CallNode && nt_ref(nt, st, "receiver") < 0 ? nt_str(nt, st, "name") : NULL;
-  int an = 0;
-  *av = mx && (want_prepend ? is_prepend_name(mx) : is_include_name(mx))
-        ? nt_arr(nt, nt_ref(nt, st, "arguments"), "arguments", &an) : NULL;
-  return *av ? an : 0;
-}
 /* the module such an argument names, read in a body's namespace key: its
    name, *at its namespace; NULL when it names no module of the program */
 static const char *bi_mixin_module(const NodeTable *nt, int arg, const char *key, char *at, size_t cap) {
@@ -15826,12 +15922,10 @@ static int bi_body_defines(const NodeTable *nt, const char *ns, const char *leaf
     for (int j = 0; j < bn; j++) {
       int d = fwd_body_def(nt, bb[j]);
       if (d >= 0 && nt_ref(nt, d, "receiver") < 0 && sp_streq(nt_str(nt, d, "name"), nm)) return 1;
-      for (int pp = 0; pp < 2; pp++) {
-        const int *av; int an = bi_mixin_args(nt, bb[j], pp, &av);
-        for (int a = 0; a < an; a++) {
-          const char *ml = bi_mixin_module(nt, av[a], key, at, sizeof at);
-          if (ml && bi_body_defines(nt, at, ml, nm, seen)) return 1;
-        }
+      int prep; const int *av; int an = mixin_stmt_args(nt, bb[j], &prep, &av);
+      for (int a = 0; a < an; a++) {
+        const char *ml = bi_mixin_module(nt, av[a], key, at, sizeof at);
+        if (ml && bi_body_defines(nt, at, ml, nm, seen)) return 1;
       }
     }
   }
@@ -15894,20 +15988,18 @@ static int bi_receivers_all_answer(const char *cls, const char *nm) {
       (!builtin_instance_method_known("String", nm) || !builtin_instance_method_known("Symbol", nm))) return 0;
   return any;
 }
+/* What bi_root_defines answered for the names a pass asked: one answer per
+   name while the pass's node table stands (the program's defs are all there
+   before the copies are made). Held by the pass that asks. */
+typedef struct { char *name[64]; unsigned char ans[64]; int n; } BiRoots;
+static void bi_roots_free(BiRoots *br) { for (int i = 0; i < br->n; i++) free(br->name[i]); }
+
 /* does the program define nm at the top level, or in a body of Object or
    Kernel? CRuby's lookup reaches such a def after the receiver's class and
    the mixed-in module, ahead of Object's and Kernel's builtin method */
 static int def_at_top_level(const NodeTable *nt, int n0, int def);
-static int bi_root_defines(const NodeTable *nt, const char *nm) {
-  /* one answer per name for the node table (the program's defs are all
-     there before the copies are made) */
-  static const NodeTable *cache_nt = NULL;
-  static char *cache_name[64]; static int cache_ans[64], cache_n = 0;
-  if (cache_nt != nt) {
-    for (int i = 0; i < cache_n; i++) free(cache_name[i]);
-    cache_n = 0; cache_nt = nt;
-  }
-  for (int i = 0; i < cache_n; i++) if (sp_streq(cache_name[i], nm)) return cache_ans[i];
+static int bi_root_defines(const NodeTable *nt, BiRoots *br, const char *nm) {
+  for (int i = 0; i < br->n; i++) if (sp_streq(br->name[i], nm)) return br->ans[i];
   int o = 0;
   for (int id = 0; id < nt->count && !o; id++)
     if (nt_kind(nt, id) == NK_DefNode && nt_ref(nt, id, "receiver") < 0 && nt_str(nt, id, "name") &&
@@ -15917,10 +16009,11 @@ static int bi_root_defines(const NodeTable *nt, const char *nm) {
     o = bi_body_defines(nt, "", "Object", nm, &seen) || bi_body_defines(nt, "", "Kernel", nm, &seen);
     bi_seen_free(&seen);
   }
-  if (cache_n < 64 && (cache_name[cache_n] = strdup(nm))) cache_ans[cache_n++] = o;
+  /* a copy: the node a name came from may be renamed later in the pass */
+  if (br->n < 64 && (br->name[br->n] = strdup(nm))) br->ans[br->n++] = o;
   return o;
 }
-static int bi_keeps_receiverless(const NodeTable *nt, const char *cls, int own, const char *nm) {
+static int bi_keeps_receiverless(const NodeTable *nt, BiRoots *br, const char *cls, int own, const char *nm) {
   if (is_enum_helper_name(nm)) return 1;
   if (!object_instance_method_name(nm)) return 0;
   /* in a copy of the program's own method, a public method of Object is
@@ -15928,7 +16021,7 @@ static int bi_keeps_receiverless(const NodeTable *nt, const char *cls, int own, 
      (a receiver class with no builtin method of the name): such a call
      stays as it was */
   if (object_public_method_name(nm))
-    return !own || (!bi_receivers_all_answer(cls, nm) && bi_root_defines(nt, nm) && !own_chain_defines(nt, cls, nm));
+    return !own || (!bi_receivers_all_answer(cls, nm) && bi_root_defines(nt, br, nm) && !own_chain_defines(nt, cls, nm));
   if (own && own_chain_defines(nt, cls, nm)) return 0;
   return !bi_receiver_answers(cls, nm);
 }
@@ -15992,7 +16085,7 @@ static int program_defines_name_off_class(const NodeTable *nt, int n0, const cha
 /* `self` in nodes [lo, hi] reads the `__self` parameter, and the
    receiverless calls there (Kernel's aside) take it as their receiver; cls
    and own as bi_keeps_receiverless takes them */
-static void bi_self_to_local(NodeTable *nt, int lo, int hi, const char *cls, int own) {
+static void bi_self_to_local(NodeTable *nt, BiRoots *br, int lo, int hi, const char *cls, int own) {
   /* the block of a call that runs it with another self (`7.instance_exec
      { inspect }`): a public Object method there stays as it was. The nodes
      are pre-order, so a block's subtree is one range; a block passed as a
@@ -16022,7 +16115,7 @@ static void bi_self_to_local(NodeTable *nt, int lo, int hi, const char *cls, int
     }
     else if (kind == NK_CallNode && nt_ref(nt, id, "receiver") < 0) {
       const char *nm = nt_str(nt, id, "name");
-      if (!nm || bi_keeps_receiverless(nt, cls, own, nm)) continue;
+      if (!nm || bi_keeps_receiverless(nt, br, cls, own, nm)) continue;
       if ((keep_all || (rebound && rebound[id - lo])) && object_public_method_name(nm)) continue;
       int rd = nt_new_node(nt, "LocalVariableReadNode"); if (rd < 0) break;
       nt_node_set_str(nt, rd, "name", "__self");
@@ -16103,7 +16196,8 @@ static void own_enum_mixin_defs(const NodeTable *nt, const char *ns, const char 
         if (g) { *own = g; (*own)[(*nown)++] = bb[j]; }
         continue;
       }
-      const int *av; int an = bi_mixin_args(nt, bb[j], part == 2, &av);
+      int prep; const int *av; int an = mixin_stmt_args(nt, bb[j], &prep, &av);
+      if (an > 0 && prep != (part == 2)) an = 0;
       for (int a = an - 1; a >= 0; a--) {
         const char *ml = bi_mixin_module(nt, av[a], key, at, sizeof at);
         if (!ml || bi_seen(seen, at, ml)) continue;
@@ -16117,10 +16211,10 @@ static void own_enum_mixin_defs(const NodeTable *nt, const char *ns, const char 
    taking the receiver as the first parameter as a builtin's does, the
    reopening's def left to answer for the module's includers; cls the
    module's name */
-static int own_enum_generic(NodeTable *nt, int def, const char *cls) {
+static int own_enum_generic(NodeTable *nt, BiRoots *br, int def, const char *cls) {
   int copy = nt_clone_subtree(nt, def);
   if (copy < 0) return -1;
-  bi_self_to_local(nt, copy, nt->count - 1, cls, 1);
+  bi_self_to_local(nt, br, copy, nt->count - 1, cls, 1);
   int pn = nt_ref(nt, copy, "parameters");
   if (pn < 0) { pn = nt_new_node(nt, "ParametersNode"); if (pn < 0) return -1; nt_node_set_ref(nt, copy, "parameters", pn); }
   int sp = nt_new_node(nt, "RequiredParameterNode"); if (sp < 0) return -1;
@@ -16204,13 +16298,9 @@ static int enum_own_copy(NodeTable *nt, int bdef, int bi, int id, int in_copy, i
 /* Is `v` a name the program builds rather than spells: an interpolation
    (`"#{q}_by"`, `:"on_#{t}"`), a `to_sym` / `intern` / `+` of anything? */
 static int bi_value_builds_name(const NodeTable *nt, int v) {
+  if (vp_one(nt, v, VPS_NONE | VP_PARENS_ONLY, &v) != VP1_NODE) return 0;
   NodeKind k = nt_kind(nt, v);
   if (k == NK_InterpolatedStringNode || k == NK_InterpolatedSymbolNode) return 1;
-  if (k == NK_ParenthesesNode) {
-    int b = nt_ref(nt, v, "body"), bn = 0;
-    const int *bb = b >= 0 ? nt_arr(nt, b, "body", &bn) : NULL;
-    return bn > 0 && bi_value_builds_name(nt, bb[bn - 1]);
-  }
   if (k != NK_CallNode) return 0;
   const char *nm = nt_str(nt, v, "name");
   return nm && (sp_streq(nm, "to_sym") || sp_streq(nm, "intern") || sp_streq(nm, "+"));
@@ -16262,6 +16352,7 @@ static int bi_program_calls_late(const NodeTable *nt, int n0) {
 
 int desugar_builtins(Compiler *c) {
   if (sp_builtin_enum_names_n == 0) return 0;
+  BiRoots br = { .n = 0 };
   NodeTable *nt = (NodeTable *)c->nt;
   int root = nt->root_id;
   int top = root >= 0 ? nt_ref(nt, root, "statements") : -1;
@@ -16312,7 +16403,7 @@ int desugar_builtins(Compiler *c) {
         int dbi = d >= 0 ? builtin_enum_name_index(nt_str(nt, d, "name")) : -1;
         if (dbi >= 0 && dbi < nbdef && nt_ref(nt, d, "receiver") < 0 && !nt_int(nt, d, "node_bi", 0) &&
             !bi_def_calls_super(nt, d) && bi_def_visibility(nt, bb[k]) == BVIS_PUBLIC) {
-          int g = own_enum_generic(nt, d, mn);
+          int g = own_enum_generic(nt, &br, d, mn);
           if (g < 0) break;
           nt_node_set_int(nt, g, "enum_prog_def", 1);
           if (gdef[dbi] >= 0 && !nt_int(nt, gdef[dbi], "enum_prog_def", 0)) bdef[dbi] = gdef[dbi];
@@ -16355,7 +16446,7 @@ int desugar_builtins(Compiler *c) {
       /* `self` and the receiverless calls in the body */
       int dbody = nt_ref(nt, def, "body");
       int lo = dbody >= 0 ? dbody : def;
-      bi_self_to_local(nt, lo, hi, mn, 0);
+      bi_self_to_local(nt, &br, lo, hi, mn, 0);
       /* the generic definition itself stays out of the program: the copies
          below are what the call sites use. It keeps a name of its own so
          that, orphaned in the node table, it cannot be mistaken for a
@@ -16411,7 +16502,7 @@ int desugar_builtins(Compiler *c) {
       gdef[bi] = -1;
     }
     if (bi < nbuiltin) continue;
-    int g = own_enum_generic(nt, d, own_mn);
+    int g = own_enum_generic(nt, &br, d, own_mn);
     if (g < 0) break;
     /* a method its module's bodies leave private or protected (`private
        def m`, a bare `private` above the def, `private :m` after it,
@@ -16423,6 +16514,7 @@ int desugar_builtins(Compiler *c) {
     gdef[bi] = g;
     changed = 1;
   }
+  bi_roots_free(&br);
   free(own);
   if (!changed) { free(gdef); free(bdef); free(nb); return 0; }
   int n0 = nt->count;   /* the program's own nodes (the generics among them): the call sites to clone for */
@@ -17922,7 +18014,10 @@ int desugar_builtin_enum_calls(Compiler *c) {
        Float or String one has no route to the reopen yet) */
     int reopen_cn = ty_is_array(rt) ? CORE_ARRAY : ty_is_hash(rt) ? CORE_HASH : (rt == TY_RANGE || rt == TY_OBJ_RANGE) ? CORE_RANGE :
                     rt == TY_ENUMERATOR ? CORE_ENUMERATOR : -1;
-    if (reopen_cn >= 0 && an_reopen_owner(c, id, reopen_cn) >= 0) continue;
+    if (reopen_cn >= 0 && an_reopen_owner(c, id, reopen_cn) >= 0) {
+      if (enum_unrename(nt, id)) changed = 1;
+      continue;
+    }
     if (ty_is_array(rt) || ty_is_hash(rt) || rt == TY_RANGE || rt == TY_FLOAT_RANGE ||
         rt == TY_STR_RANGE || (rt == TY_ENUMERATOR && !lazy_driven)) ok = 1;
     /* a Range of objects: the walks that stop at the block's answer walk its
@@ -18304,6 +18399,7 @@ extern int sp_builtin_extra_name_index(int idx, const char *name);
 
 int desugar_builtin_scalar_defs(Compiler *c) {
   NodeTable *nt = (NodeTable *)c->nt;
+  BiRoots br = { .n = 0 };
   int root = nt->root_id;
   int top = root >= 0 ? nt_ref(nt, root, "statements") : -1;
   if (top < 0) return 0;
@@ -18388,7 +18484,7 @@ int desugar_builtin_scalar_defs(Compiler *c) {
           nt_node_set_arr(nt, pn, "requireds", nr, rn + 1); free(nr); }
         int dbody = nt_ref(nt, def, "body");
         int lo = dbody >= 0 ? dbody : def;
-        bi_self_to_local(nt, lo, hi, mn, 0);
+        bi_self_to_local(nt, &br, lo, hi, mn, 0);
         { char gn[256]; snprintf(gn, sizeof gn, "%s%s", sp_bx_prefix[bx], name); nt_node_set_str(nt, def, "name", gn); }
         if (bi >= 0) gdef[bx][bi] = def;
       }
@@ -18468,7 +18564,7 @@ int desugar_builtin_scalar_defs(Compiler *c) {
         nr[0] = spself; for (int j = 0; j < rn; j++) nr[j + 1] = reqs[j];
         nt_node_set_arr(nt, pn, "requireds", nr, rn + 1); free(nr); }
       int lo = clone;
-      bi_self_to_local(nt, lo, hi, mn, 1);
+      bi_self_to_local(nt, &br, lo, hi, mn, 1);
       { char gn[256]; snprintf(gn, sizeof gn, "%s%s", sp_bx_prefix[bx], name); nt_node_set_str(nt, clone, "name", gn); }
       if (closed) nt_node_set_int(nt, clone, "bx_closed", 1);
       int bi = sp_builtin_extra_name_index(bx, name);
@@ -18505,6 +18601,7 @@ int desugar_builtin_scalar_defs(Compiler *c) {
       changed = 1;
     }
   }
+  bi_roots_free(&br);
   free(tb); free(tfile);
   if (!changed) {
     for (int bx = 0; bx < SP_BX_N; bx++) {
@@ -18632,15 +18729,21 @@ static int bx_mixes_in(Compiler *c, int m, int k, int depth) {
   for (int i = 0; i < mi->nprepended_mods; i++) if (bx_mixes_in(c, mi->prepended_mods[i], k, depth + 1)) return 1;
   return 0;
 }
-/* Is class or module k String, Symbol, Comparable, Object, Kernel,
-   BasicObject or the top level, or a module one of them or the top level
-   mixes in, as the class table holds them? (k < 0: a class the caller does
-   not know, so yes.) */
+/* The Comparable builtins (other than Integer and Float) whose call to a
+   method the program adds to `module Comparable` takes the method's copy
+   (bx_cmp_own_class). NULL ends the list. */
+static const char *const bx_cmp_recv_cls[] = { "String", "Symbol", "Time", "Rational", NULL };
+/* Is class or module k one of bx_cmp_recv_cls, Numeric, Comparable,
+   Object, Kernel, BasicObject or the top level, or a module one of them or
+   the top level mixes in, as the class table holds them? (k < 0: a class
+   the caller does not know, so yes.) */
 static int bx_owner_in_string_chain(Compiler *c, int k) {
   if (k < 0 || k >= c->nclasses || k == c->toplevel_class) return 1;
-  static const char *const roots[] = { "String", "Symbol", "Comparable", "Object", "Kernel", "BasicObject" };
-  for (int i = 0; i < (int)(sizeof roots / sizeof roots[0]); i++) {
-    int r = comp_builtin_class_named(c, roots[i]);
+  static const char *const more[] = { "Numeric", "Comparable", "Object", "Kernel", "BasicObject", NULL };
+  int nr = 0;
+  while (bx_cmp_recv_cls[nr]) nr++;
+  for (int i = 0; i < nr || more[i - nr]; i++) {
+    int r = comp_builtin_class_named(c, i < nr ? bx_cmp_recv_cls[i] : more[i - nr]);
     if (r == k) return 1;
     for (int a = r, d = 0; a >= 0 && a < c->nclasses && d < 64; a = c->classes[a].parent, d++)
       if (bx_mixes_in(c, a, k, 0)) return 1;
@@ -18753,15 +18856,11 @@ static int bx_program_aliases(Compiler *c, const char *nm) {
   free(ents);
   return hit;
 }
-/* Does the program have its own instance method nm that a String or a
-   Symbol answers before Kernel's: on String or Symbol or a module either
-   mixes in, on Object, Kernel or BasicObject, at the top level or in a
-   module the top level includes (bx_owner_in_string_chain), or by an
-   alias? */
-/* The Comparable builtins (other than the numbers) whose call to a method
-   the program adds to `module Comparable` takes the method's copy
-   (bx_cmp_own_class). NULL ends the list. */
-static const char *const bx_cmp_recv_cls[] = { "String", "Symbol", "Time", "Rational", NULL };
+/* Does the program have its own instance method nm that a String,
+   Symbol, Time or Rational answers before Kernel's: on one of them,
+   Numeric or a module they mix in, on Object, Kernel or BasicObject, at
+   the top level or in a module the top level includes
+   (bx_owner_in_string_chain), or by an alias? */
 static int bx_kernel_name_own(Compiler *c, const char *nm) {
   if (program_defines_object_method_named(c, nm) || bx_program_aliases(c, nm)) return 1;
   for (int i = 0; bx_cmp_recv_cls[i]; i++) {
@@ -27486,11 +27585,7 @@ static int biv_frozen_literal(const NodeTable *nt, int r) {
 static int biv_is_reflective_set(const NodeTable *nt, int call) {
   const char *nm = nt_str(nt, call, "name");
   if (!nm) return 0;
-  if (is_ivar_set_name(nm)) return 1;
-  if (!is_send_family(nm)) return 0;
-  int an = nt_ref(nt, call, "arguments"), ac = 0;
-  const int *av = an >= 0 ? nt_arr(nt, an, "arguments", &ac) : NULL;
-  const char *sn = ac > 0 && nt_kind(nt, av[0]) == NK_SymbolNode ? nt_str(nt, av[0], "value") : NULL;
+  const char *sn = call_sent_name(nt, call, NULL);
   return sn && is_ivar_set_name(sn);
 }
 static int biv_is_self_or_implicit(const NodeTable *nt, int call) {
@@ -29212,10 +29307,90 @@ static int body_defines_smethod(const NodeTable *nt, const int *st, int n, const
   return 0;
 }
 
+/* ---- a literal attach_function called through a function pointer (#11362) ----
+ *
+ * An attach_function whose name, parameter types and return type are all
+ * literals of the scalar vocabulary below, written as a statement of the
+ * module's own body, is also an ffi_func entry (register_ffi_decls) whose C
+ * callee is a function pointer, not an extern: the address the attach
+ * resolves at run time, which the bundled package hands to the program
+ * (FFI::Native.note_fp). The library is opened and the symbol looked up as
+ * before, so ffi_lib, NotFoundError and the order the libraries are tried in
+ * stay the package's. A call reaches the pointer with its arguments
+ * converted as an ffi_func's are: no Array, no table lookup, no libffi, and
+ * an unboxed answer. Anything else -- a pointer, a callback, a :string
+ * answer (nil for NULL), :bool (true or false), an unsigned 64-bit answer
+ * (a Bignum past 2**63), a typedef'd name, varargs, options -- keeps the
+ * package's own route (__ffi_call). */
+static int ffi_direct_arg_spec(const char *v) {
+  static const char *const A[] = {
+    "int", "int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64", "char", "uchar",
+    "short", "ushort", "uint", "long", "ulong", "long_long", "ulong_long", "size_t", "float", "double",
+    "string", NULL };
+  for (int i = 0; v && A[i]; i++) if (sp_streq(A[i], v)) return 1;
+  return 0;
+}
+static int ffi_direct_ret_spec(const char *v) {
+  static const char *const R[] = {
+    "void", "int", "int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "char", "uchar",
+    "short", "ushort", "uint", "long", "long_long", "size_t", "float", "double", NULL };
+  for (int i = 0; v && R[i]; i++) if (sp_streq(R[i], v)) return 1;
+  return 0;
+}
+int ffi_attach_direct(const NodeTable *nt, int call, const char **fname, const char **csym, int *arr,
+                      const char **ret) {
+  if (call < 0 || nt_kind(nt, call) != NK_CallNode || nt_ref(nt, call, "block") >= 0) return 0;
+  const char *nm = nt_str(nt, call, "name");
+  int r = nt_ref(nt, call, "receiver");
+  if (!nm || !sp_streq(nm, "attach_function") || (r >= 0 && nt_kind(nt, r) != NK_SelfNode)) return 0;
+  int an = nt_ref(nt, call, "arguments");
+  int ac = 0; const int *av = an >= 0 ? nt_arr(nt, an, "arguments", &ac) : NULL;
+  if (ac != 3 && ac != 4) return 0;
+  int ai = ac == 4 ? 2 : 1, ri = ac == 4 ? 3 : 2;
+  if (nt_kind(nt, av[0]) != NK_SymbolNode || nt_kind(nt, av[ai]) != NK_ArrayNode ||
+      nt_kind(nt, av[ri]) != NK_SymbolNode) return 0;
+  const char *cs = NULL;
+  if (ac == 4) {
+    cs = ffi_literal_name(nt, av[1]);
+    if (!cs) return 0;
+  }
+  const char *rv = nt_str(nt, av[ri], "value");
+  if (!ffi_direct_ret_spec(rv)) return 0;
+  int en = 0; const int *els = nt_arr(nt, av[ai], "elements", &en);
+  for (int i = 0; i < en; i++)
+    if (nt_kind(nt, els[i]) != NK_SymbolNode || !ffi_direct_arg_spec(nt_str(nt, els[i], "value"))) return 0;
+  if (fname) *fname = nt_str(nt, av[0], "value");
+  if (csym) *csym = cs;
+  if (arr) *arr = av[ai];
+  if (ret) *ret = rv;
+  return 1;
+}
+/* Is attach statement `call` one the module calls through a pointer: a
+   direct attach (ffi_attach_direct) written as a statement of `body`, and
+   the only attach of its name the body makes (one under a rescue may be
+   replaced by a fallback proc, __ffi_define_proc) */
+int ffi_attach_direct_stmt(const NodeTable *nt, int body, int call) {
+  const char *fname = NULL;
+  if (!ffi_attach_direct(nt, call, &fname, NULL, NULL, NULL)) return 0;
+  int n = 0, own = 0;
+  const int *st = body >= 0 ? nt_arr(nt, body, "body", &n) : NULL;
+  for (int k = 0; k < n; k++) if (st[k] == call) own = 1;
+  if (!own) return 0;
+  FfiAttach *at = NULL; int na = 0, cap = 0, same = 0;
+  ffi_collect_attaches(nt, body, &at, &na, &cap);
+  for (int i = 0; i < na; i++) {
+    if (at[i].kind == 0 && sp_streq(at[i].name, fname)) same++;
+    free(at[i].name);
+  }
+  free(at);
+  return same == 1;
+}
+
 int comp_ffi_library_module(const NodeTable *nt, const char *mn) {
   return mn && ffi_library_module(nt, mn, nt->count);
 }
 
+static int native_twin_def(NodeTable *nt, int like, const char *mn, const char *fname, int np);
 int desugar_ffi_library_functions(Compiler *c) {
   NodeTable *nt = (NodeTable *)c->nt;
   int n0 = nt->count;
@@ -29239,7 +29414,18 @@ int desugar_ffi_library_functions(Compiler *c) {
       int dup = 0;
       for (int j = 0; j < i; j++) if (at[j].kind == at[i].kind && sp_streq(at[j].name, at[i].name)) dup = 1;
       if (dup || body_defines_smethod(nt, st, n, at[i].name)) continue;
-      if (at[i].kind == 0) {
+      /* (a module's alone: register_ffi_decls reads module bodies, and a
+         class's twin def would have no entry to call) */
+      if (at[i].kind == 0 && class_def_is_module(nt, m) && ffi_attach_direct_stmt(nt, body, at[i].at)) {
+        /* called through the pointer the attach resolves: the def is for
+           the module reached as a value, a constant calls the pointer */
+        int arr = -1, np = 0;
+        ffi_attach_direct(nt, at[i].at, NULL, NULL, &arr, NULL);
+        (void)nt_arr(nt, arr, "elements", &np);
+        int d = native_twin_def(nt, at[i].at, mn, at[i].name, np);
+        if (d >= 0) out[no++] = d;
+      }
+      else if (at[i].kind == 0) {
         int np = 0, mcb = 0;
         int d = ffi_attach_params(nt, at[i].at, &np, &mcb) >= 0
                   ? ffi_fixed_def(nt, at[i].at, at[i].name, at[i].name, np, mcb)

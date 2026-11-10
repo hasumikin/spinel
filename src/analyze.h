@@ -715,6 +715,7 @@ const NodeKind *class_def_kinds(int *n);   /* the node kinds a definition can be
 const NodeKind *class_def_module_kinds(int *n);   /* ...a module's definition can be */
 int class_def_builder(const NodeTable *nt, int def_node);   /* a constant write's Class.new / Module.new call that defines a class, -1 for none */
 int class_def_path(const NodeTable *nt, int def_node);   /* the constant node it writes: a header's path, a builder's write or path target */
+int mixin_stmt_args(const NodeTable *nt, int st, int *prepend, const int **av);   /* a body's receiverless include/prepend: its argument count, -1 for another node */
 const char *class_def_name(const NodeTable *nt, int def_node);   /* the constant name it writes, NULL for none */
 const char *class_def_bare_name(const NodeTable *nt, int def_node);   /* ...written as a plain constant, NULL under a path */
 void class_def_set_body(NodeTable *nt, int def_node, int body);   /* its body statements, as a pass rebuilds them */
@@ -810,6 +811,11 @@ ElabEntry *elab_replaced_attrs(Compiler *c, int *n);
 void elab_attr_scope(Compiler *c, const ElabEntry *e, int scope);
 /* does class cls's own side hold such an accessor version of name? */
 int elab_attr_replaced(Compiler *c, int cls, const char *name);
+/* Does a later method of class cls's own instance side replace its
+   attr_* accessor `name` (a writer's as `x=`) as the load phase ends: the
+   class's last version of the name the registration applies is a def, an
+   alias or another method, not the accessor? */
+int elab_inst_attr_replaced(Compiler *c, int cls, const char *name);
 /* The attr_* call that declares the accessor name (a writer's as `x=`)
    class cls's instances answer: its own, or a module's it includes or
    prepends, or a superclass's; -1 for none (a Struct's or a Data's member,
@@ -926,8 +932,8 @@ int scope_ret_fresh(Compiler *c, int mi);
    is dropped and hands its block on only to such an iterator? */
 int an_iter_discards_block(Compiler *c, int call);
 /* Does method mi answer a String literal on every path (no `return`)? A
-   frozen literal keeps one identity, the handle its site has
-   (SP_SHARE_STRING_LITERALS), which a handle made over its bytes finds. */
+   frozen literal keeps one identity, the handle its site has,
+   which a handle made over its bytes finds. */
 int scope_ret_str_literal(Compiler *c, int mi);
 int scope_ret_param(Compiler *c, int mi);
 /* A String `||` or `&&` over a String left operand: a tail whose operands
@@ -975,8 +981,8 @@ int dyn_open_site(Compiler *c, int n, int *shift);
 void dyn_open_reach(Compiler *c, int n, int k, DynReach *r);
 int dyn_method_appends(Compiler *c, int mi, int j);
 /* The code under node may append to local vn in place, or hand it to a
-   parameter that is lent (a byref slot or the handle): 1 also for a
-   subtree too deep to be walked to the bottom */
+   parameter that appends to it: 1 also for a subtree too deep to be walked
+   to the bottom */
 int an_subtree_may_lend_local(Compiler *c, int node, const char *vn);
 int an_local_array_changed_x(Compiler *c, const char *xn, Scope *xs);
 int an_local_array_stores_unshared(Compiler *c, const char *xn, Scope *xs);
@@ -1072,6 +1078,7 @@ int an_elem_read_in_bounds(Compiler *c, int id);
 /* is position pos of a multiple assignment's value, read from a constant Array of a proven length, within it and no nil (a position from the end is not asked)? */
 int masgn_const_elem_in_range(Compiler *c, int value, long long pos);
 int scalar_nil_only_call(Compiler *c, int id, TyKind rt);
+int an_scalar_reopen_answers(Compiler *c, int id, const char *name, int recv, TyKind rt, int bonly);   /* analyze_infer.c */
 int nullable_scalar_nil_only_call(Compiler *c, int id);
 int nullable_int_elem_array(Compiler *c, int node);
 /* an Array literal with an element and no splat: it is never empty */
@@ -1186,6 +1193,7 @@ const char *block_post_name(Compiler *c, int block, int idx);
 int block_lone_rest(Compiler *c, int block);
 int block_rest_marker(Compiler *c, int block);
 int block_lead_only(Compiler *c, int block);
+int product_block_binds_elems(Compiler *c, int block);
 int block_auto_splats(int P, int O, int Q, int R);
 int block_no_keywords(Compiler *c, int block);
 void block_fill(int P, int O, int Q, int R, int n, int *ot, int *ps);
@@ -1415,11 +1423,6 @@ int std_stream_bare_call_own(Compiler *c, int id, const char *nm);   /* bare nm 
    arguments are Integers, no argument is a splat, a keyword Hash or a block
    argument, and no method of the program's own stands in for Array's. */
 int strh_call_op(Compiler *c, int call, TyKind rt);
-/* ...and the same for the gate's rounds, where an argument whose type is
-   not settled yet counts as the type asked (the gate runs again, and
-   refuses for good, once it is) */
-int strh_call_op_in(Compiler *c, int call, TyKind rt, int unknown_ok);
-int strh_literal_held(Compiler *c, int n);   /* an Array literal a variable of any kind is written */
 int strh_var_read(const NodeTable *nt, int n);   /* a variable's read, whatever its kind of variable */
 
 #endif

@@ -1411,17 +1411,12 @@ void intern_block_params(Compiler *c) {
   }
 }
 
-/* --share-strings: is lv the shared handle a String of type t is held in?
+/* Is lv the shared handle a String of type t is held in?
    A pass that types the slot as that String leaves it so; resetting it each
    round, against share_default_apply setting it back, kept the fixpoint
-   from settling. A String Array the rule settled in its poly form, whose
-   boxes hold the handles, is that Array the same way: a block's parameter
-   `tap` hands the Array of `"x y".split(" ")` went back to the typed Array
-   every round and the rule converted it again. */
+   from settling. */
 static int lv_is_handle_of(const Compiler *c, const LocalVar *lv, TyKind t) {
-  if (t != TY_STRING && t != TY_STR_ARRAY) return 0;
-  Repr r = repr_of_slot(c, lv);
-  return t == TY_STRING ? r.share : r.elems_handle;
+  return t == TY_STRING && repr_of_slot(c, lv).share;
 }
 
 static int lv_widen(LocalVar *lv, TyKind t) {
@@ -5299,25 +5294,29 @@ static TyKind local_write_ty(Compiler *c, int id, int stashed) {
   return newt;
 }
 
+/* A String local or parameter holds the handle (one-string), from the round
+   its type says String: not the loop variable of an unrolled define_method
+   (collect_dm_each_unroll: no C slot, its reads are the literal), nor a slot
+   an --rbs seed pins to another type. A slot typed the handle without the
+   mark (a parameter a bare super widened from a handle) takes the mark.
+   Answers whether it changed the slot. */
+int slot_take_string_handle(Compiler *c, LocalVar *lv) {
+  if (lv->type != TY_STRING && !(lv->type == TY_STRBUF && !lv->str_shared)) return 0;
+  if (lv->rbs_seeded && lv->rbs_type != TY_UNKNOWN && lv->rbs_type != TY_STRING) return 0;
+  if (lv->owner >= 0) {
+    const Scope *sc = &c->scopes[lv->owner];
+    if (sc->dm_subst_name && lv->name && sp_streq(lv->name, sc->dm_subst_name)) return 0;
+  }
+  lv_set_type(lv, TY_STRBUF);
+  if (!lv->str_shared) { lv->str_shared = 1; comp_touch_scope(lv->owner); }
+  return 1;
+}
+
 /* What infer_write_types keeps of a slot across its join: the decisions
    about the slot's representation that a re-derivation from its writes alone
    would undo. Inside the recompute frame (`stashed`), a slot the round could
    not derive at all also keeps the type the reset stashed. */
-static void lv_keep_decisions(LocalVar *lv, int stashed) {
-  /* A slot already promoted to the append handle keeps that REPRESENTATION
-     across the recompute frame. The round's reset re-derives `out = +""` as a
-     plain TY_STRING, and promote_append_accumulators -- which fires on a
-     TY_STRING slot -- then re-promotes it, so the two passes trade the slot
-     back and forth and the fixpoint never converges: every compile ran to the
-     128-iteration cap. TY_STRBUF *is* a String; only the storage differs, so
-     re-deriving the Ruby-level type must not clobber the choice. Same reason
-     infer_bigint_loop_locals re-seeds inside this frame. If the re-derived
-     type is neither String nor the handle, the promotion's precondition is
-     genuinely gone and the flag goes with it. */
-  if (lv->str_append) {
-    if (lv->type == TY_STRING) lv_set_type(lv, TY_STRBUF);
-    else if (lv->type != TY_STRBUF) lv->str_append = 0;
-  }
+static void lv_keep_decisions(Compiler *c, LocalVar *lv, int stashed) {
   /* The same contract for a slot narrowed to a pointer array. The reset
      re-derives it from its writes, which still read the poly array, and the
      two array KINDS unify to the plain poly SCALAR -- strictly worse than
@@ -5361,7 +5360,7 @@ static void lv_keep_decisions(LocalVar *lv, int stashed) {
   if (stashed && !lv->is_param && !lv->is_block_param && !lv->rbs_seeded &&
       lv->type == TY_UNKNOWN && (TyKind)lv->gc_root != TY_UNKNOWN)
     lv_set_type(lv, (TyKind)lv->gc_root);
-  /* The shared-mutable / append-accumulator promotion is durable -- the mark
+  /* The shared-mutable promotion is durable -- the mark
      is, and analyze re-asserts the slot type from it after the fixpoint. Do it
      HERE too, before infer_write_types compares the slot with its stash: the
      reset wipes the promotion, the writes re-derive TY_STRING, and
@@ -5369,13 +5368,9 @@ static void lv_keep_decisions(LocalVar *lv, int stashed) {
      Neither yielded, so the fixpoint ran to its cap on every program with a
      shared-mutable string (#3227, #4116). Same treatment oa_pin gets just
      above, and for the same reason. */
-  if ((lv->str_shared || lv->str_append) &&
+  if (lv->str_shared &&
       (lv->type == TY_STRING || lv->type == TY_STR_ARRAY)) lv_set_type(lv, TY_STRBUF);
-  /* every String local holds the handle (one-string) */
-  if (lv->type == TY_STRING && !lv->is_param && !lv->rbs_seeded && !lv->byref_out) {
-    lv_set_type(lv, TY_STRBUF);
-    if (!lv->str_shared) { lv->str_shared = 1; comp_touch_scope(lv->owner); }
-  }
+  slot_take_string_handle(c, lv);
 }
 
 /* infer_write_multi_assign, with each table narrowed to a pointer array
@@ -5672,7 +5667,7 @@ int infer_write_types(Compiler *c) {
 
   for (int s = 0; s < c->nscopes; s++)
     for (int i = 0; i < c->scopes[s].nlocals; i++)
-      lv_keep_decisions(&c->scopes[s].locals[i], 1);
+      lv_keep_decisions(c, &c->scopes[s].locals[i], 1);
 
   /* Detect change vs the stashed old types -- over EXACTLY the slots the reset
      above stashed. It used to skip only params and block params, so a slot the
@@ -5755,7 +5750,7 @@ int rejoin_local_writes(Compiler *c) {
       if (m == was) continue;
       slot_set(c, lv, m, v, nt_ref(nt, id, "value"));
       if (lv->oa_pin != TY_UNKNOWN && lv->type != lv->oa_pin) lv->oa_pin = TY_UNKNOWN;
-      lv_keep_decisions(lv, 0);
+      lv_keep_decisions(c, lv, 0);
       if (lv->type == was) continue;
       changed = 1;
       if (lv->type != TY_POLY) continue;
@@ -12593,6 +12588,23 @@ int block_lead_only(Compiler *c, int block) {
   return P >= 1 && rk == NK_ImplicitRestNode;
 }
 
+/* A literal block taking exactly two plain requireds, `|x, y|` (no
+   destructuring, rest, trailing comma, optional, post or keyword): the
+   shape of a product block whose pair is bound element by element, typed
+   (infer_block_params) and read straight from the arrays (codegen) */
+int product_block_binds_elems(Compiler *c, int block) {
+  const NodeTable *nt = c->nt;
+  if (block < 0 || nt_kind(nt, block) != NK_BlockNode) return 0;
+  if (!block_lead_only(c, block) || block_rest_marker(c, block)) return 0;
+  if (!block_param_name(c, block, 1) || block_param_name(c, block, 2)) return 0;
+  if (block_param_is_multi(c, block, 0) || block_param_is_multi(c, block, 1)) return 0;
+  if (block_keyword_name(c, block, 0)) return 0;
+  int bp = nt_ref(nt, block, "parameters");
+  int pn = bp >= 0 && nt_kind(nt, bp) == NK_BlockParametersNode ? nt_ref(nt, bp, "parameters") : -1;
+  /* (nor a `**` or a `&b` of its own) */
+  return pn >= 0 && nt_ref(nt, pn, "keyword_rest") < 0 && nt_ref(nt, pn, "block") < 0;
+}
+
 /* CRuby's auto-splat, for a block, a proc and instance_exec alike: one
    Array passed alone is spread across the parameters when the block takes a
    required (leading or post) or two optionals, and more than one positional
@@ -13512,19 +13524,34 @@ static int block_with_own_self(Compiler *c, int call) {
    PARENT's ref/arr slot is retargeted (a node's type string is immutable).
    Does not descend into nested class/module/def bodies, or a block that
    runs with another self (block_with_own_self), whose self differs. */
+/* Does class `cname` answer a bare call of `nm` in a block run with the
+   class as self: a class method in its chain (any visibility: the call
+   is marked self_call, so a private one stays callable), or Module's
+   name / to_s / inspect (which `Foo.name` reaches as the bare call does)? */
+static int bare_call_on_class(Compiler *c, const char *cname, const char *nm) {
+  int ci = cname && nm ? comp_class_index(c, cname) : -1;
+  if (ci < 0) return 0;
+  return comp_cmethod_in_chain(c, ci, nm, NULL) >= 0 || is_name_reader(nm);
+}
 static void subtree_self_to_const(Compiler *c, int root, const char *cname, int depth) {
   NodeTable *nt = (NodeTable *)c->nt;
   if (root < 0 || root >= nt->count || depth > 200) return;
   NodeKind k = nt_kind(nt, root);
   if (k == NK_ClassNode || k == NK_ModuleNode || k == NK_DefNode) return;
-  /* a bare class_variable_get / _set / _defined? is a call on self too */
-  if (k == NK_CallNode && nt_ref(nt, root, "receiver") < 0 && is_cvar_reflection_name(nt_str(nt, root, "name"))) {
+  /* a bare class_variable_get / _set / _defined? is a call on self too, and
+     so is a bare call the class answers: its own class method (also
+     inherited) or Module's name / to_s / inspect. Left bare, it ran on the
+     self of the code around the block (`A.k = Foo.class_eval { name }`
+     answered "A"). */
+  if (k == NK_CallNode && nt_ref(nt, root, "receiver") < 0 &&
+      (is_cvar_reflection_name(nt_str(nt, root, "name")) || bare_call_on_class(c, cname, nt_str(nt, root, "name")))) {
     int cr = nt_new_node(nt, "ConstantReadNode");
     if (cr < 0) return;
     nt_node_set_str(nt, cr, "name", cname);
     comp_grow_node_arrays(c);
     c->nscope[cr] = c->nscope[root];
     nt_node_set_ref(nt, root, "receiver", cr);
+    nt_node_set_int(nt, root, "self_call", 1);
   }
   int keep = k == NK_CallNode ? block_with_own_self(c, root) : -1;
   SpNode *nd = &nt->nodes[root];
@@ -13739,6 +13766,8 @@ int desugar_class_eval_value(Compiler *c) {
     if (stmts < 0 || beg < 0) continue;
     nt_node_set_arr(nt, stmts, "body", items, ni);
     nt_node_set_ref(nt, beg, "body", stmts);
+    /* (its body runs with the class as self, not the code around it) */
+    nt_node_set_int(nt, beg, "self_rebound", 1);
     /* the call becomes a transparent alias of the begin's value */
     nt_node_set_str(nt, id, "name", "itself");
     nt_node_set_ref(nt, id, "receiver", beg);
@@ -16671,11 +16700,31 @@ static int block_leaves_unify(Compiler *c, int block, Scope *s, TyKind t) {
   return changed;
 }
 
+/* The other methods call id can hand its block to bind it too: a virtual
+   call's initially resolved method is only one arm. Fold their sites and
+   forwards through the same binding walk, including a version entry's arms.
+   An open target set can call the block with anything, as a kept block can. */
+static int block_dispatch_bindings(Compiler *c, int id, int mi, int ym, const BlockSig *s,
+                                   TyKind *pos, char *absent, char *seen) {
+  int targets[CPT_MAX], n = cplan_entries(c, id, targets, CPT_MAX);
+  if (n == CPT_UNKNOWN) return 1;
+  int np = s->P + s->O + s->Q, kept = 0;
+  for (int i = 0; i < n; i++) {
+    int t = targets[i];
+    if (t == mi || t == ym) continue;   /* already bound by block_bind_plan */
+    int arms[VER_MAX_ARMS + 1];
+    int na = c->scopes[t].entry ? ver_entry_targets(c, t, arms, NULL) : (arms[0] = t, 1);
+    for (int j = 0; j < na; j++)
+      kept |= block_reach(c, arms[j], s, pos, absent, pos + np, seen, 1, 0);
+  }
+  return kept;
+}
+
 /* What binds `block`, handed by call `id` to method `mi` whose sites are
    `ym`'s (its yields when `yields`, else its &block's calls): pos/absent
-   from every site (block_site_types), posf/absentf from the calls the
-   method hands the block on to, and 1 when it is kept, so anything may call
-   it (block_reach). The caller frees the four arrays. */
+   from every site (block_site_types), posf/absentf from the other dispatch
+   arms and the calls the method hands the block on to, and 1 when it is
+   kept, so anything may call it (block_reach). The caller frees the arrays. */
 static int block_bind_plan(Compiler *c, int id, int block, int mi, int ym, int yields, BlockSig *s,
                            TyKind **pos, char **absent, TyKind **posf, char **absentf) {
   const NodeTable *nt = c->nt;
@@ -16707,6 +16756,7 @@ static int block_bind_plan(Compiler *c, int id, int block, int mi, int ym, int y
   *absentf = calloc((size_t)np + 1, 1);
   if (!seen || !*posf || !*absentf) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
   int kept = block_reach(c, ym, s, *posf, *absentf, *posf + np, seen, 0, 0);
+  kept |= block_dispatch_bindings(c, id, mi, ym, s, *posf, *absentf, seen);
   free(seen);
   return kept;
 }
@@ -17152,8 +17202,15 @@ static int infer_block_params_container_arms(Compiler *c, const NodeTable *nt, i
     return changed | 2;
   }
 
-  /* array.product(other) { |pair| } binds the boxed pair array */
+  /* array.product(other) { |pair| } binds the boxed pair array; `|x, y|`
+     takes it apart, x an element of the receiver and y one of other, as
+     zip's block does (and its emitter reads them from the arrays) */
   if (sp_streq(name, "product") && ty_is_array(rt) && p0) {
+    int pa = nt_ref(nt, id, "arguments"), pn = 0;
+    const int *pv = pa >= 0 ? nt_arr(nt, pa, "arguments", &pn) : NULL;
+    if (product_block_binds_elems(c, block) && pn == 1 && nt_kind(nt, pv[0]) != NK_SplatNode &&
+        ty_is_array(infer_type(c, pv[0])))
+      return infer_zip_block_params(c, id, block, p0, rt) | 2;
     Scope *aps = comp_scope_of(c, block);
     if (bp_widen(aps, p0, TY_POLY)) changed = 1;
     return changed | 2;
@@ -18079,6 +18136,7 @@ static int infer_block_params_call_arms(Compiler *c, const NodeTable *nt, int id
   /* call to a user yielding method: block params take the yield arg types */
   {
     int mi = -1;
+    TyKind pre_ty = TY_UNKNOWN;   /* what a builtin pre-arm beside mi yields its block */
     if (recv < 0) {
       /* the class body's own class methods, then self's: the class
          methods first in a class method, the instance chain, and a
@@ -18205,6 +18263,14 @@ static int infer_block_params_call_arms(Compiler *c, const NodeTable *nt, int id
           if (rt0 == TY_POLY && !bdflt && (ty_block_yield(TY_POLY_ARRAY, name, byt, 4) > 0 ||
                                            ty_block_yield(TY_POLY_POLY_HASH, name, byt, 4) > 0))
             bdflt = 1; }
+        /* ...and a name a boxed receiver's dispatch drives the block
+           through a builtin pre-arm for (each_index, times, a String's
+           each_line / each_char / each_byte / each_codepoint): the block's
+           first parameter also takes the builtin's element, joined below
+           with the adopted method's yields -- a String's lines reached a
+           block typed from a user method's Symbol yields */
+        if (rt0 == TY_POLY && !poly_enum_op_for(name) && poly_blk_prearm_name(name) && !sp_streq(name, "synchronize"))
+          pre_ty = sp_streq(name, "each_line") || sp_streq(name, "each_char") ? TY_STRING : TY_INT;
         if (ndef > 0 && (poly_enum_op_for(name) || bdflt || (mi < 0 && rt0 == TY_POLY))) {
           Scope *bs2 = comp_scope_of(c, block);
           for (int k = 0; ; k++) {
@@ -18282,6 +18348,12 @@ static int infer_block_params_call_arms(Compiler *c, const NodeTable *nt, int id
         }
       }
       changed |= block_params_widen(c, block, &s, kept, posf, absentf, posf + np);
+      if (pre_ty != TY_UNKNOWN && s.P + s.O > 0) {
+        const char *bp = block_sig_name(c, &s, 0);
+        LocalVar *lv = bp ? scope_local_intern(comp_scope_of(c, block), bp) : NULL;
+        TyKind merged = lv ? ty_unify(lv->type, pre_ty) : TY_UNKNOWN;
+        if (lv && merged != lv->type) { lv_set_type(lv, merged); changed = 1; }
+      }
       free(pos); free(absent); free(posf); free(absentf);
       return changed | 2;
     }

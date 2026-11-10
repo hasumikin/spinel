@@ -286,6 +286,9 @@ static void emit_respond_to_runtime_name(Compiler *c, int id, Buf *b, int recv, 
   }
   buf_puts(b, "NULL})");
   buf_printf(b, ")) || sp_poly_responds_builtin(_t%d, _n%d)", tv, tv);
+  /* a class value: Class's surface, a `class Class` reopening's methods
+     and its own class methods */
+  class_value_responds_runtime(tv, b);
   /* a boxed IO: the methods IO reopenings add, by the handle's kind */
   for (int s2 = 0; s2 < c->nscopes; s2++) {
     Scope *ms = &c->scopes[s2];
@@ -1342,7 +1345,7 @@ int emit_call_reflection_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
   /* Class.const_defined?(:K): compile-time presence check. Constants are
      recorded in a flat namespace, so this consults the global const and class
      tables rather than the receiver's own constants. */
-  if (sp_streq(name, "const_defined?") && recv >= 0 && argc >= 1 &&
+  if (sp_streq(name, "const_defined?") && recv >= 0 && argc >= 1 && class_recv_user_cmethod(c, id, recv, name) < 0 &&
       nt_kind(nt, recv) == NK_ConstantReadNode) {
     NodeKind ak = nt_kind(nt, argv[0]);
     const char *qm = NULL;
@@ -3453,11 +3456,19 @@ int emit_call_new_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const c
       if (bcn && sp_streq(bcn, "Array"))  { buf_puts(b, "sp_PolyArray_new()"); return 1; }
       if (bcn && sp_streq(bcn, "Hash"))   { buf_puts(b, "sp_PolyPolyHash_new()"); return 1; }
       if (bcn && sp_streq(bcn, "Object")) { buf_puts(b, "sp_box_obj(sp_Object_new(), SP_BUILTIN_OBJECT)"); return 1; }
-      if (bcn && sp_streq(bcn, "Integer")) {
-        buf_puts(b, "({ sp_raise_cls(\"TypeError\", SPL(\"allocator undefined for Integer\")); sp_box_nil(); })");
+      if (bcn && is_allocator_undefined_class(bcn)) {
+        buf_printf(b, "({ sp_raise_cls(\"TypeError\", SPL(\"allocator undefined for %s\")); sp_box_nil(); })", bcn);
         return 1;
       }
     }
+  }
+
+  /* Class#allocate on a class value no constant names (`x.class.allocate`):
+     the dispatch a boxed class value gets, sp_cls_allocate, which the program
+     has generated when comp_class_value_allocate asks (g_gen_cls_answers). */
+  if (comp_class_value_allocate(c, id)) {
+    buf_puts(b, "sp_cls_allocate(sp_box_class("); emit_expr(c, recv, b); buf_puts(b, "))");
+    return 1;
   }
 
   if (recv >= 0 && sp_streq(name, "new") && self_class_static_ci(c, recv) >= 0) {
@@ -3603,6 +3614,26 @@ static void cls_value_unlisted_default(const char *name, int tc, Buf *b) {
    constant, or on self in a class method (minitest's
    `public_instance_methods(true).grep(/^test_/)`), where an inherited method
    runs on whichever class received the call. */
+/* `K.name(1)`, `K.to_s(x)`, `K.inspect(a, b)` on a class without its own
+   method of the name: Module#name, to_s and inspect take no argument, and
+   CRuby raises the arity ArgumentError. The message for these arguments,
+   in `am`; 0 when only the run time knows the count (a splat, a `**h`). */
+int class_name_reader_arity_msg(Compiler *c, const char *nm, int argc, const int *argv, char *am, size_t n) {
+  if (!class_name_reader_argc_raises(c, nm, argc, argv)) return 0;
+  arity_message(am, n, argc, 0, 0, NULL);
+  return 1;
+}
+/* ...the raise itself, after the receiver and the arguments are read */
+static int emit_class_name_reader_arity(Compiler *c, const char *nm, int recv, int argc, const int *argv, Buf *b) {
+  char am[96];
+  if (!class_name_reader_arity_msg(c, nm, argc, argv, am, sizeof am)) return 0;
+  buf_puts(b, "({ (void)("); emit_expr_for_effect(c, recv, b); buf_puts(b, "); ");
+  for (int i = 0; i < argc; i++) {
+    buf_puts(b, "(void)("); emit_expr_for_effect(c, argv[i], b); buf_puts(b, "); ");
+  }
+  buf_printf(b, "sp_raise_cls(\"ArgumentError\", \"%s\"); (const char *)NULL; })", am);
+  return 1;
+}
 static int emit_class_instance_methods_all(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv) {
   int prot = sp_streq(name, "instance_methods");
   if (!prot && !sp_streq(name, "public_instance_methods")) return 0;
@@ -4413,7 +4444,8 @@ int emit_call_class_value_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
        without one, emit_poly_cls_value_builtin, which faces it a Class) */
     int fnode = -1; TyKind fkind = TY_UNKNOWN;
     int cls_face = view_face_top(&fnode, &fkind) && fnode == recv && fkind == TY_CLASS;
-    if (!cls_shadowed && !cls_face && argc == 0 && is_name_reader(name)) {
+    if (!cls_shadowed && !cls_face && is_name_reader(name) &&
+        (argc == 0 || class_name_reader_argc_raises(c, name, argc, argv))) {
       int ncc = 0;
       if (class_recv_user_cmethod(c, id, recv, name) >= 0) cls_shadowed = 1;
       else if (class_recv_static_ci(c, recv) < 0 && class_recv_is_dynamic(c, recv)) {
@@ -4426,6 +4458,10 @@ int emit_call_class_value_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
       /* An anonymous Struct/Data class has no name: CRuby answers nil for
          #name (and an `#<Class:0x...>`-shaped #to_s). The synthetic
          StructAnon_<n> the compiler keys it by is not a Ruby-visible name. */
+      /* Module#name / to_s / inspect take no argument: CRuby raises the
+         arity ArgumentError after it reads the receiver and the arguments
+         (an anonymous Struct class too) */
+      if (argc > 0 && emit_class_name_reader_arity(c, name, recv, argc, argv, b)) return 1;
       if (sp_streq(name, "name")) {
         /* the anon class is registered keyed to the node that produced it
            (analyze_scope), so the receiver node identifies it */
@@ -4493,7 +4529,7 @@ int emit_call_class_value_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
        the (flat) constant and class tables -- constants carry no class
        qualifier in the registry, so this is the same namespace a read
        resolves against. */
-    if (sp_streq(name, "const_defined?") && argc == 1) {
+    if (sp_streq(name, "const_defined?") && argc == 1 && class_recv_user_cmethod(c, id, recv, name) < 0) {
       NodeKind a0k = nt_kind(nt, argv[0]);
       const char *cn0 = NULL;
       if (a0k == NK_SymbolNode) cn0 = nt_str(nt, argv[0], "value");
@@ -4596,7 +4632,7 @@ int emit_call_class_value_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
        included modules, then the superclass chain), stopping before Object,
        whose constants are the top-level ones. `constants(false)` is own-only.
        #2674 */
-    if (sp_streq(name, "constants") && argc <= 1) {
+    if (sp_streq(name, "constants") && argc <= 1 && class_recv_user_cmethod(c, id, recv, name) < 0) {
       const char *rcn = nt_type(nt, recv) &&
                         (nt_kind(nt, recv) == NK_ConstantReadNode ||
                          nt_kind(nt, recv) == NK_ConstantPathNode)
@@ -4796,7 +4832,7 @@ int emit_call_class_value_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
     /* the Class rows (Module#include?, a hook's no-op) that answer the call */
     if (cplan_class_row(c, id, recv, name) && emit_builtin_op_tmp(c, id, recv, TY_CLASS, name, _clt, b)) return 1;
     /* Module#class_variables: the registered cvars, own + ancestors (#2719) */
-    if (sp_streq(name, "class_variables") && argc == 0) {
+    if (sp_streq(name, "class_variables") && argc == 0 && class_recv_user_cmethod(c, id, recv, name) < 0) {
       const char *rcn9 = nt_kind(nt, recv) == NK_ConstantReadNode
                          ? nt_str(nt, recv, "name") : NULL;
       int rci9 = rcn9 ? const_node_class_index(c, recv) : -1;
@@ -4970,7 +5006,7 @@ int emit_call_class_value_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
         /* Only the candidates this call could actually reach set the return
            type. One that cannot take this many arguments is not a possible
            receiver here, so its return type is not part of the answer. */
-        if (!cls_arm_takes_argc(&c->scopes[kmi], argc, splat9)) continue;
+        if (!cplan_cls_arm_takes(c, id, kmi, argc, splat9)) continue;
         ncand9++; defmi9 = kmi;
         TyKind kr = (TyKind)c->scopes[kmi].ret;
         if (!uret_set9) { uret9 = kr; uret_set9 = 1; }
@@ -5086,12 +5122,20 @@ int emit_call_class_value_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
             /* A class whose method cannot take this many arguments gets the
                answer CRuby gives, rather than no arm (which would fall to the
                default's NoMethodError, naming the wrong failure). */
-            if (!cls_arm_takes_argc(&c->scopes[kmi], argc, splat9)) {
-              /* the range the arm judged, which a default widens */
-              char kw[256], am[512];
-              scope_arity_kw_suffix(c, &c->scopes[kmi], kw, sizeof kw);
-              arity_message(am, sizeof am, argc, c->scopes[kmi].nrequired, c->scopes[kmi].nparams, kw);
-              buf_printf(b, "sp_raise_cls(\"ArgumentError\", \"%s\"); break;", am);
+            if (!cplan_cls_arm_takes(c, id, kmi, argc, splat9)) {
+              char am[600];
+              if (splat9) {
+                /* the range the arm judged, which a default widens */
+                char kw[256];
+                scope_arity_kw_suffix(c, &c->scopes[kmi], kw, sizeof kw);
+                arity_message(am, sizeof am, argc, c->scopes[kmi].nrequired, c->scopes[kmi].nparams, kw);
+              }
+              else {
+                int kwh9 = nt_argv_kwh(nt, argv, argc);
+                poly_arm_count(c, &c->scopes[kmi], kwh9, kwh9 >= 0 ? argc - 1 : argc, -1, am, sizeof am);
+              }
+              emit_poly_arity_raise(b, am);
+              buf_puts(b, " break;");
               continue;
             }
             TyKind kr = (TyKind)c->scopes[kmi].ret;
@@ -5133,7 +5177,9 @@ int emit_call_class_value_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
              switch left the result slot at its default -- a junk value the
              caller could not tell from a real answer. */
           if (sg9) emit_cls_value_sg_arms(c, id, name, argc, argv, tr9, b);
-          /* Module#name / to_s / inspect for a class without its own */
+          /* Module#name / to_s / inspect for a class without its own, which
+             takes no argument */
+          char nb9am[96];
           if (!rdef9 && argc == 0 && is_name_reader(name)) {
             char nb[128];
             if (is_class_name_name(name)) snprintf(nb, sizeof nb, "sp_str_frozen_name(sp_class_name_or_nil(_t%d))", tk9);
@@ -5143,6 +5189,9 @@ int emit_call_class_value_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
             if (slot9 == TY_POLY) buf_printf(b, "_t%d = sp_box_nullable_str(%s); break;", tr9, nb);
             else buf_printf(b, "_t%d = %s; break;", tr9, nb);
           }
+          else if (!rdef9 && is_name_reader(name) &&
+                   class_name_reader_arity_msg(c, name, argc, argv, nb9am, sizeof nb9am))
+            buf_printf(b, " default: sp_raise_cls(\"ArgumentError\", \"%s\"); break;", nb9am);
           else if (!rdef9) buf_printf(b, " default: %s; break;", rraise9);
           buf_printf(b, " } _t%d; })", tr9);
           unhoist_dispatch_args(c, hn9, hsv9, hty9);
@@ -5309,10 +5358,14 @@ int emit_call_class_method_arms(Compiler *c, int id, Buf *b, const NodeTable *nt
               int ik = comp_method_in_chain(c, k, "initialize", NULL);
               buf_printf(b, "%s.cls_id == %d ? (sp_%s *)sp_%s_new(", cmethod_cls_token(c, encl), k, ncls->c_name, c->classes[k].c_name);
               if (ik >= 0) emit_args_filled(c, ik, nt_ref(nt, id, "arguments"), "", b);
+              /* (an initialize that takes its block as a proc takes it in
+                 each arm, as the static constructor below does) */
+              if (ik >= 0) emit_ctor_block_slot(c, id, ik, c->scopes[ik].nparams > 0 ? ", " : "", b);
               buf_puts(b, ") : ");
             }
             buf_printf(b, "sp_%s_new(", ncls->c_name);
             if (initm >= 0) emit_args_filled(c, initm, nt_ref(nt, id, "arguments"), "", b);
+            if (initm >= 0) emit_ctor_block_slot(c, id, initm, c->scopes[initm].nparams > 0 ? ", " : "", b);
             buf_puts(b, "))");
             return 1;
           }

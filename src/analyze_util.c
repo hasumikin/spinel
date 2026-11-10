@@ -10,13 +10,14 @@
    classes (builtin_class_at, builtin_names.c), read here and by the load
    graph. */
 
-/* A socket row is a constant only after `require "socket"`, as in CRuby. */
+/* Library classes are constants only after their require, as in CRuby. */
 static const BuiltinClass *builtin_row(const char *n) {
   if (!n) return NULL;
   int i = builtin_core_class_slot(n);
   const BuiltinClass *r = i >= 0 ? builtin_class_at(i) : NULL;
   if (!r) return NULL;
   if ((r->flags & BC_SOCKET) && !sp_feature_required("socket")) return NULL;
+  if ((r->flags & BC_OSTRUCT) && !sp_feature_required("ostruct")) return NULL;
   return r;
 }
 
@@ -93,7 +94,34 @@ static int const_path_is(const NodeTable *nt, int node, const char *pn, const ch
 }
 /* Does the program write the constant nm into the class or module named pn:
    in a body of it, or through the path `pn::nm = v`? */
+static int program_writes_const_in_tree(Compiler *c, const char *pn, const char *nm);
+/* The answers for the tree as it is: a scoped constant read asks again for
+   the same pair, and each question walked every class body and every nil */
+static struct { const NodeTable *nt; unsigned ver; unsigned long edits; int count; ANameHash keys; signed char *ans; int cap; } g_pwc;
 int program_writes_const_in(Compiler *c, const char *pn, const char *nm) {
+  const NodeTable *nt = c->nt;
+  if (!pn || !nm) return program_writes_const_in_tree(c, pn, nm);
+  if (g_pwc.nt != nt || g_pwc.ver != nt->version || g_pwc.edits != nt->edits || g_pwc.count != nt->count) {
+    for (int i = 0; i < g_pwc.keys.n; i++) free((char *)g_pwc.keys.key[i]);
+    anh_free(&g_pwc.keys); memset(&g_pwc.keys, 0, sizeof g_pwc.keys);
+    g_pwc.nt = nt; g_pwc.ver = nt->version; g_pwc.edits = nt->edits; g_pwc.count = nt->count;
+  }
+  size_t pl = strlen(pn), nl = strlen(nm);
+  char kb[256], *key = pl + nl + 2 <= sizeof kb ? kb : malloc(pl + nl + 2);
+  memcpy(key, pn, pl); key[pl] = '\001'; memcpy(key + pl + 1, nm, nl + 1);
+  int i = anh_find(&g_pwc.keys, key);
+  if (i >= 0) { int r = g_pwc.ans[i]; if (key != kb) free(key); return r; }
+  int r = program_writes_const_in_tree(c, pn, nm);
+  if (g_pwc.keys.n == g_pwc.cap) {
+    g_pwc.cap = g_pwc.cap ? g_pwc.cap * 2 : 64;
+    g_pwc.ans = realloc(g_pwc.ans, (size_t)g_pwc.cap);
+    if (!g_pwc.ans) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  }
+  g_pwc.ans[g_pwc.keys.n] = (signed char)r;
+  anh_add(&g_pwc.keys, key == kb ? strdup(kb) : key);
+  return r;
+}
+static int program_writes_const_in_tree(Compiler *c, const char *pn, const char *nm) {
   const NodeTable *nt = c->nt;
   int ndk = 0; const NodeKind *dk = class_def_kinds(&ndk);
   for (int dh = 0; dh < ndk; dh++)
@@ -1519,6 +1547,34 @@ int const_class_value_only(Compiler *c, int node) {
    receiver names at compile time (class_recv_static_ci), up its ancestors;
    -1 when there is none or the class is known only at run time: the target
    of call `call` on receiver `node` (call_target). */
+/* Does the program answer Module#name / to_s / inspect (nm) for every class
+   value, outside any one class's own chain: an instance method of a reopened
+   Module or Class (or a module they include), or a class method of Object or
+   BasicObject, which every class inherits? Then the builtin reader, and its
+   arity, is not what a call reaches. */
+int prog_owns_class_name_reader(Compiler *c, const char *nm) {
+  for (int k = 0; k < c->nclasses; k++) {
+    const char *n = c->classes[k].name;
+    if (!n) continue;
+    if ((sp_streq(n, "Module") || sp_streq(n, "Class")) && comp_method_in_chain(c, k, nm, NULL) >= 0) return 1;
+    if ((sp_streq(n, "Object") || sp_streq(n, "BasicObject")) && comp_cmethod_in_chain(c, k, nm, NULL) >= 0) return 1;
+  }
+  return 0;
+}
+/* ...and do these arguments give Module#name / to_s / inspect a count the
+   compiler knows, so the call raises the arity ArgumentError: one or more
+   arguments, no splat and no `**h` (only the run time knows those), and
+   no program method answering the reader for every class? */
+int class_name_reader_argc_raises(Compiler *c, const char *nm, int argc, const int *argv) {
+  const NodeTable *nt = c->nt;
+  if (argc <= 0 || nt_argv_has_splat(nt, argv, argc) || prog_owns_class_name_reader(c, nm)) return 0;
+  for (int i = 0; i < argc; i++) {
+    if (nt_kind(nt, argv[i]) != NK_KeywordHashNode) continue;
+    int en = 0; const int *el = nt_arr(nt, argv[i], "elements", &en);
+    for (int e = 0; e < en; e++) if (nt_kind(nt, el[e]) != NK_AssocNode) return 0;
+  }
+  return 1;
+}
 int class_recv_user_cmethod(Compiler *c, int call, int node, const char *name) {
   int ci = class_recv_static_ci(c, node);
   return ci >= 0 ? call_target(c, call, ci, name, CT_CMETHOD, NULL) : -1;
@@ -4740,7 +4796,7 @@ int send_blind_recv_owns(Compiler *c, int call, int recv, TyKind srt, const char
                  : (srt == TY_STRING || srt == TY_STRBUF) ? "String" : srt == TY_SYMBOL ? "Symbol"
                  : ty_is_array(srt) ? "Array" : ty_is_hash(srt) ? "Hash"
                  : srt == TY_RANGE ? "Range" : srt == TY_PROC ? "Proc" : srt == TY_TIME ? "Time" : NULL;
-  return bc && (builtin_method_known(bc, name) || builtin_module_owns(bc, name));
+  return bc && builtin_answers_ahead_of(bc, name, "Object");
 }
 
 /* A receiverless call directly in a class body is sent to the class. */
@@ -5812,42 +5868,7 @@ int comp_value_dropped(Compiler *c, int n) {
 }
 
 
-/* Is argument n's type want, or (unknown_ok, for the gate's early rounds)
-   not settled yet? */
-static int strh_arg_ty_ok(const Compiler *c, int n, TyKind want, TyKind want2, int unknown_ok) {
-  TyKind t = comp_ntype(c, n);
-  return t == want || t == want2 || (unknown_ok && t == TY_UNKNOWN);
-}
-/* Does block blk take no parameter or one plain one, which binds the
-   element (not a destructuring `|(x, y)|`, a rest, a default, a keyword, a
-   block parameter or a block-local)? */
-static int strh_plain_block_params(Compiler *c, int blk) {
-  const NodeTable *nt = c->nt;
-  int bp = nt_ref(nt, blk, "parameters");
-  if (bp < 0) return 1;
-  if (nt_kind(nt, bp) != NK_BlockParametersNode) return 0;
-  int lc = 0;
-  nt_arr(nt, bp, "locals", &lc);
-  if (lc > 0) return 0;
-  int pn = nt_ref(nt, bp, "parameters");
-  if (pn < 0) return 1;
-  int n = 0;
-  const int *rq = nt_arr(nt, pn, "requireds", &n);
-  if (n > 1 || (n == 1 && nt_kind(nt, rq[0]) != NK_RequiredParameterNode)) return 0;
-  /* (a destructuring parameter is a hidden parameter and a read of its
-     elements by the time the walk runs) */
-  const char *pnm = n == 1 ? nt_str(nt, rq[0], "name") : NULL;
-  if (pnm && !strncmp(pnm, "__destr", 7)) return 0;
-  int k = 0;
-  nt_arr(nt, pn, "optionals", &k);
-  if (k > 0) return 0;
-  nt_arr(nt, pn, "posts", &k);
-  if (k > 0) return 0;
-  nt_arr(nt, pn, "keywords", &k);
-  if (k > 0) return 0;
-  return nt_ref(nt, pn, "rest") < 0 && nt_ref(nt, pn, "keyword_rest") < 0 && nt_ref(nt, pn, "block") < 0;
-}
-int strh_call_op_in(Compiler *c, int call, TyKind rt, int unknown_ok) {
+int strh_call_op(Compiler *c, int call, TyKind rt) {
   const NodeTable *nt = c->nt;
   if (rt != TY_STR_ARRAY || call < 0 || nt_kind(nt, call) != NK_CallNode) return STRH_NONE;
   const char *nm = nt_str(nt, call, "name");
@@ -5855,27 +5876,10 @@ int strh_call_op_in(Compiler *c, int call, TyKind rt, int unknown_ok) {
   const int *av = ca >= 0 ? nt_arr(nt, ca, "arguments", &argc) : NULL;
   if (nt_argv_has(nt, av, argc, NT_ARG_SPLAT | NT_ARG_KEYWORDS | NT_ARG_BLOCK)) return STRH_NONE;
   int op = strh_op(nm, argc, blk < 0 ? 0 : nt_kind(nt, blk) == NK_BlockNode ? 1 : 2);
-  if (op == STRH_EACH && !strh_plain_block_params(c, blk)) return STRH_NONE;
-  if ((op == STRH_ELEM && argc == 1) || op == STRH_STORE)
-    for (int k = 0; k < (op == STRH_STORE ? 1 : argc); k++)
-      if (!strh_arg_ty_ok(c, av[k], TY_INT, TY_INT, unknown_ok)) return STRH_NONE;
-  /* (what is stored is a String, or a box that may hold one, which
-     sp_StrhArray_unbox opens: any other value is no store of this form, and
-     widens the Array (fold_container_evidence), so the gate sees it) */
-  if (op == STRH_PUSH || (op == STRH_STORE && argc == 2))
-    for (int k = op == STRH_STORE ? 1 : 0; k < argc; k++) {
-      TyKind vt = comp_ntype(c, av[k]);
-      if (vt != TY_STRING && vt != TY_STRBUF && vt != TY_UNKNOWN && vt != TY_POLY) return STRH_NONE;
-    }
-  /* (the other operand of == is another Array of handles) */
-  if (op == STRH_EQ && !strh_arg_ty_ok(c, av[0], TY_STR_ARRAY, TY_STR_ARRAY, unknown_ok)) return STRH_NONE;
-  /* (a separator or a needle that is a String) */
-  if ((op == STRH_JOIN || op == STRH_INCLUDE) && argc == 1 &&
-      !strh_arg_ty_ok(c, av[0], TY_STRING, TY_STRBUF, unknown_ok)) return STRH_NONE;
+  if (op == STRH_ELEM && argc == 1 && comp_ntype(c, av[0]) != TY_INT) return STRH_NONE;
   if (op != STRH_NONE && share_builtin_overridden(c, "Array", nm)) return STRH_NONE;
   return op;
 }
-int strh_call_op(Compiler *c, int call, TyKind rt) { return strh_call_op_in(c, call, rt, 0); }
 /* Is node n a read of a variable (a local, an instance variable, a global, a
    constant or a class variable), which the handle element emitters can read
    again where an element is used as the slot it is? */
@@ -6409,3 +6413,172 @@ int capture_cells_shape(const NodeTable *nt, int id) {
 }
 /* See analyze_internal.h. */
 int respond_to_missing_defined(Compiler *c) { return !an_name_binder_free(c, "respond_to_missing?"); }
+/* Do def's parameters hold `...` (a ForwardingParameterNode as keyword_rest)? */
+int def_takes_forwarding(const NodeTable *nt, int def) {
+  int pn = def >= 0 && nt_kind(nt, def) == NK_DefNode ? nt_ref(nt, def, "parameters") : -1;
+  int kr = pn >= 0 ? nt_ref(nt, pn, "keyword_rest") : -1;
+  return kr >= 0 && nt_kind(nt, kr) == NK_ForwardingParameterNode;
+}
+
+/* ---- --ext-class: the instance methods a host calls by name ----
+
+   A library (--ext-init) exports the module methods --ext-entry names in
+   their C signatures. A host that holds an object of the program (an entry
+   answered it) has no way to call the object's methods: every call the
+   program makes is a direct C call, and the poly dispatch of a boxed
+   receiver is a switch the call site owns. --ext-class names the classes
+   whose public instance methods the library also exports in a table of
+   (name, arity, thunk), read by sp_ext_send and sp_ext_methods
+   (ext_emit_method_tables, codegen.c). */
+
+/* A kind a boxed value converts to and from: a builtin kind with a traits
+   row, an object of the program, or an array of such objects. */
+int ext_ty_crosses(TyKind t) {
+  return ty_traits_of(t) != NULL || ty_is_object(t) || ty_is_ptr_array(t);
+}
+
+/* A kind a thunk can check a host's argument against before it unboxes
+   it: a scalar the thunk checks itself (ext_thunk_scalar, truthiness), a
+   String whose value or handle sp_poly_arg_str_chk checks, a container
+   whose sp_poly_as_* answers NULL or raises for a value of another kind,
+   an object whose unbox checks the class, or a boxed value. The other
+   kinds (Range, Time, Symbol, Regexp, IO, ...) unbox by a plain cast, so
+   a method with such a parameter stays out of the table. */
+static int ext_param_ty_checked(TyKind t) {
+  switch (t) {
+  case TY_INT: case TY_FLOAT: case TY_BOOL: case TY_STRING: case TY_STRBUF: case TY_POLY:
+  case TY_INT_ARRAY: case TY_FLOAT_ARRAY: case TY_STR_ARRAY: case TY_POLY_ARRAY:
+  case TY_INT_ARRAY_ARRAY: case TY_FLOAT_ARRAY_ARRAY:
+  case TY_SYM_POLY_HASH: case TY_STR_POLY_HASH: case TY_POLY_POLY_HASH:
+    return 1;
+  default:
+    return ty_is_object(t) || ty_is_ptr_array(t);
+  }
+}
+
+/* Whether the list names class_id: a class or module of the program (not
+   a reopened builtin, not a package's native class). A module exports its
+   singleton methods only. */
+/* Whether the list names a class of that name: as written (`Sub`), or as
+   the last name of a path (`ExtSub::Sub`); `all` names every class. */
+static int ext_name_listed(const char *name) {
+  if (!g_ext_classes || !*g_ext_classes || !name) return 0;
+  if (sp_streq(g_ext_classes, "all")) return 1;
+  size_t n = strlen(name);
+  for (const char *p = g_ext_classes; *p; ) {
+    const char *e = strchr(p, ',');
+    size_t len = e ? (size_t)(e - p) : strlen(p);
+    if (len == n && !strncmp(p, name, n)) return 1;
+    if (len > n + 2 && !strncmp(p + len - n, name, n) && p[len - n - 1] == ':' && p[len - n - 2] == ':') return 1;
+    if (!e) break;
+    p = e + 1;
+  }
+  return 0;
+}
+
+int ext_class_exported(Compiler *c, int class_id) {
+  if (!g_ext_classes || !*g_ext_classes || class_id < 0 || class_id >= c->nclasses) return 0;
+  ClassInfo *ci = &c->classes[class_id];
+  if (!ci->name || is_builtin_reopen(ci->name) || ci->is_native_class) return 0;
+  return ext_name_listed(ci->name);
+}
+
+/* Whether scope si is the method the chain of class_id answers for its
+   name, public there, and of a shape the thunk can call: fixed positional
+   parameters (no optional, rest, keyword or block parameter, no yield),
+   and, when `typed` (after inference; the roots are marked before it),
+   each of a kind that crosses, and a result that crosses or is none. */
+/* Whether the method of scope si has a shape the thunk calls, seen from
+   class_id (the class it is answered for): public there, not initialize,
+   fixed positional parameters (no optional, rest, keyword or block
+   parameter, no yield). */
+static int ext_method_shape(Compiler *c, int class_id, int si) {
+  if (si <= 0 || si >= c->nscopes || class_id < 0 || class_id >= c->nclasses) return 0;
+  Scope *sc = &c->scopes[si];
+  if (!sc->name || sc->class_id < 0 || is_initialize_name(sc->name)) return 0;
+  if (sc->replaced || sc->entry != ENTRY_NONE) return 0;
+  if (sc->is_cmethod) {
+    int at = -1;
+    if (comp_cmethod_vis_declared(c, class_id, sc->name, &at) != SP_VIS_PUBLIC) return 0;
+  }
+  else {
+    if (comp_class_is_module(c, &c->classes[class_id])) return 0;   /* no instance */
+    if (comp_method_vis_in_chain(c, class_id, sc->name) != SP_VIS_PUBLIC) return 0;
+  }
+  if (sc->rest_idx >= 0 || sc->kwrest_idx >= 0 || sc->nrequired != sc->nparams || sc->ps_nkw > 0 ||
+      (sc->blk_param && sc->blk_param[0]) || sc->yields)
+    return 0;
+  /* a default before a required parameter (`def f(x = 1, y)`) keeps
+     nrequired at nparams: the defaults themselves say */
+  for (int p = 0; sc->pdefault && p < sc->nparams; p++)
+    if (sc->pdefault[p] >= 0) return 0;
+  return 1;
+}
+
+int ext_method_exported(Compiler *c, int class_id, int si, int typed) {
+  if (!ext_method_shape(c, class_id, si)) return 0;
+  Scope *sc = &c->scopes[si];
+  /* the one the class (or module) answers by name: its own, or an ancestor's */
+  if (sc->is_cmethod ? comp_cmethod_in_chain(c, class_id, sc->name, NULL) != si
+                     : comp_method_in_chain(c, class_id, sc->name, NULL) != si)
+    return 0;
+  if (!typed) return 1;
+  for (int p = 0; p < sc->nparams; p++) {
+    LocalVar *lv = scope_local(sc, sc->pnames[p]);
+    if (!lv || !ext_param_ty_checked(lv->type)) return 0;
+  }
+  if (sc->ret != TY_VOID && sc->ret != TY_NIL && !ext_ty_crosses(sc->ret)) return 0;
+  return 1;
+}
+
+/* The last name of a constant reference (`Base`, `ExtSub::Base`); NULL for
+   another expression. */
+static const char *ext_const_leaf(const NodeTable *nt, int id) {
+  if (id < 0) return NULL;
+  NodeKind k = nt_kind(nt, id);
+  return k == NK_ConstantReadNode || k == NK_ConstantPathNode ? nt_str(nt, id, "name") : NULL;
+}
+
+/* The class definition of the source whose constant name is `name`; -1
+   for none. */
+static int ext_class_def_named(const NodeTable *nt, const char *name) {
+  int found = -1;
+  NT_FOREACH_KIND(nt, NK_ClassNode, d) {
+    const char *cn = found < 0 ? class_def_name(nt, d) : NULL;
+    if (cn && sp_streq(cn, name)) found = d;
+  }
+  return found;
+}
+
+/* Whether the source defines a class the list names under a class named
+   `name`: by the superclass names the definitions write, since the classes
+   defined after the method asked about are not in the table yet when a
+   define_method in its body is elaborated. */
+static int ext_listed_descendant(Compiler *c, const char *name) {
+  const NodeTable *nt = c->nt;
+  int found = 0;
+  NT_FOREACH_KIND(nt, NK_ClassNode, d) {
+    const char *cn = found ? NULL : class_def_name(nt, d);
+    if (!cn || sp_streq(cn, name) || !ext_name_listed(cn)) continue;
+    const char *sup = ext_const_leaf(nt, class_def_super(nt, d));
+    for (int h = 0; sup && !found && h < 64; h++) {
+      if (sp_streq(sup, name)) found = 1;
+      else {
+        int next = ext_class_def_named(nt, sup);
+        sup = next >= 0 ? ext_const_leaf(nt, class_def_super(nt, next)) : NULL;
+      }
+    }
+  }
+  return found;
+}
+
+/* Whether a host can call the method of scope si by name, so that it runs
+   though nothing in the program names it: its shape is one the thunk
+   calls, and the list names its class or a class under it. */
+int ext_scope_host_callable(Compiler *c, int si) {
+  if (!g_ext_classes || !*g_ext_classes || si <= 0 || si >= c->nscopes) return 0;
+  Scope *sc = &c->scopes[si];
+  if (sc->class_id < 0 || !ext_method_shape(c, sc->class_id, si)) return 0;
+  if (ext_class_exported(c, sc->class_id)) return 1;
+  return c->classes[sc->class_id].name && ext_listed_descendant(c, c->classes[sc->class_id].name);
+}

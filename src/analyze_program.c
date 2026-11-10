@@ -697,9 +697,11 @@ void prog_refuse_loads(Compiler *c) {
        methods reach the record only after the file runs */
     int margc = 0;
     const int *mav = c->nautoloads && nt_ref(nt, id, "receiver") < 0 ? call_args(nt, id, &margc) : NULL;
-    int msend = mav && margc > 1 && is_send_family(name) && nt_kind(nt, mav[0]) == NK_SymbolNode && is_mixin_call(nt_str(nt, mav[0], "value"));
+    int msent = 0;
+    const char *sent = mav ? call_sent_name(nt, id, &msent) : NULL;
+    int msend = mav && margc > msent && is_send_family(name) && sent && is_mixin_call(sent);
     if (!msend && !(mav && is_mixin_call(name) && !prog_mixin_plain_stmt(c, id))) mav = NULL;
-    for (int j = msend; mav && j < margc; j++)
+    for (int j = msend ? msent : 0; mav && j < margc; j++)
       if (elab_autoload_read(c, mav[j]))
         unsupported_feature(c, id, "--load-model=graph loads an autoload's file at its constant's first reference only later, for now");
     if (!is_autoload_name(name)) continue;
@@ -1027,9 +1029,8 @@ void prog_refuse_order(Compiler *c) {
     int st = prog_root_stmts(c, i), n = 0;
     const int *v = st >= 0 ? nt_arr(nt, st, "body", &n) : NULL;
     for (int k = 0; k < n; k++) {
-      NodeKind sk = nt_kind(nt, v[k]);
-      const char *nm = nt_str(nt, v[k], "name");
-      if (i > 0 && sk == NK_CallNode && nt_ref(nt, v[k], "receiver") < 0 && nm && is_include_name(nm))
+      int prep; const int *av;
+      if (i > 0 && mixin_stmt_args(nt, v[k], &prep, &av) >= 0 && !prep)
         unsupported_feature(c, v[k], "--load-model=graph: a top-level include in a required file (qc_object_mixin_write reads one file), for now");
     }
   }

@@ -3615,18 +3615,15 @@ static int strbuf_box_ref_as(Compiler *c, int recv, const char *fmt, Buf *b) {
 }
 
 /* Emit a shared-mutable string receiver for an operation that only READS its
-   bytes: the live buffer, not the whole-buffer copy an ordinary value read
-   makes (#3227). Answers 0 when the receiver is not such a slot, so the caller
-   falls back to emit_expr. A narrowed box is not a handle slot: its ordinary
+   bytes: the live buffer, as an ordinary value read gives. Answers 0 when
+   the receiver is not such a slot, so the caller falls back to emit_expr. A narrowed box is not a handle slot: its ordinary
    expression reads the bytes without allocating a handle first. A slot that
    can be nil (an ivar no write has set yet, which ivar_nil_recv_guard leaves
    untested) reads as NULL for it, as the copying read does, and the call
    answers as for a nil String receiver. */
 int emit_strbuf_read_ref(Compiler *c, int recv, Buf *b) {
-  Repr rr = repr_of(c, recv);
   /* (one representation: the slot's text may be bound to a temp of either
      face; SP_STR_B reads both and keeps NULL) */
-  (void)rr;
   return strbuf_box_ref_as(c, recv, "SP_STR_B(%s)", b);
 }
 /* The object_id of handle `h`, a String that can be nil: the handle is
@@ -4211,12 +4208,7 @@ int one_tail_fresh(Compiler *c, int n) {
    answers (sp_strface_pub_b), which a caller's pickup takes. */
 int one_tail_cond(Compiler *c, int n) {
   const NodeTable *nt = c->nt;
-  while (n >= 0 && nt_kind(nt, n) == NK_ParenthesesNode) {
-    int body = nt_ref(nt, n, "body"), k = 0;
-    const int *st = body >= 0 && nt_kind(nt, body) == NK_StatementsNode ? nt_arr(nt, body, "body", &k) : NULL;
-    n = k > 0 ? st[k - 1] : -1;
-  }
-  if (n < 0) return 0;
+  if (vp_one(nt, n, VPS_NONE | VP_PARENS_ONLY, &n) != VP1_NODE) return 0;
   NodeKind k = nt_kind(nt, n);
   return k == NK_IfNode || k == NK_UnlessNode || k == NK_CaseNode || k == NK_CaseMatchNode;
 }
@@ -4248,7 +4240,7 @@ int one_str_elem_call(Compiler *c, int v, TyKind rt) {
   int recv0 = nt_ref(nt, v, "receiver");
   if (rt == TY_UNKNOWN && recv0 >= 0) rt = comp_ntype(c, recv0);
   if (rt == TY_STR_ARRAY) {
-    int op = strh_call_op_in(c, v, TY_STR_ARRAY, 0);
+    int op = strh_call_op(c, v, TY_STR_ARRAY);
     if (op == STRH_ELEM || op == STRH_TAKE) return 1;
     /* (an index known only at run time, the call typed a String: its
        emitter reads the element, sp_StrArray_get) */
@@ -4402,7 +4394,7 @@ static int strbuf_slot_into(Compiler *c, int recv, Buf *b) {
     return fit;
   }
   /* a global or a constant holding the handle (--share-strings, #6765) */
-  if ((1) && recv >= 0 && repr_static_read_kind(nt_kind(c->nt, recv))) {
+  if (recv >= 0 && repr_static_read_kind(nt_kind(c->nt, recv))) {
     /* inside the shim over it, the read is its plain shadow */
     if (sb_shadowed_reader(recv)) return 0;
     return holder_static_handle_buf(c, recv, b);
@@ -4473,59 +4465,6 @@ void unsupported_feature_collect(Compiler *c, int id, const char *msg) {
   refuse_observe(msg);
   if (ln > 0) fprintf(stderr, "spinel: %s:%d: %s\n", file, ln, msg);
   else fprintf(stderr, "spinel: %s\n", msg);
-}
-
-/* --defer-refusals: a refusal kept as a check that raises only when the
-   value it is about arrives (an identity Set's member or lookup,
-   sp_idset_check): reported and counted as a deferred refusal, and the
-   build goes on with the statement as written. */
-void refusal_note_deferred(Compiler *c, int id, const char *msg) {
-  refuse_at(c, id);
-  int ln; const char *file = unsup_pos(c, id, &ln);
-  diag_record(file, ln, msg);
-  g_deferred_diags++;
-  refuse_observe(msg);
-  if (ln > 0) fprintf(stderr, "spinel: %s:%d: %s\n", file, ln, msg);
-  else fprintf(stderr, "spinel: %s\n", msg);
-}
-int g_idset_marks = 0;
-/* A value refuse_set_identity_members marked for the check (its
-   "idset_check" is the call's node + 1): rendered as itself, held in a
-   temp the check reads, then answered. The check raises NotImplementedError
-   in the refusal's words, at the call's line, for a value whose identity
-   Spinel does not keep, and passes any other. boxed: the value is wanted
-   boxed (emit_boxed). 0 for any other node, or for the node this call is
-   rendering (emit_boxed renders through emit_expr). A refusal that unwinds
-   past the rendering (a probe's, whose text is dropped) goes through here
-   first and puts the guard back, so a later rendering of the node -- the
-   next arm a probe tries -- is checked too. */
-static int g_idset_busy = -1;
-int emit_idset_checked(Compiler *c, int id, Buf *b, int boxed) {
-  if (id < 0 || id == g_idset_busy) return 0;
-  long long call = nt_int(c->nt, id, "idset_check", 0);
-  if (call <= 0) return 0;
-  int ln; const char *file = unsup_pos(c, (int)(call - 1), &ln);
-  char dmsg[2600];
-  if (ln > 0) snprintf(dmsg, sizeof dmsg, "%s:%d: %s", file, ln, g_sid_refusal_msg);
-  else snprintf(dmsg, sizeof dmsg, "%s", g_sid_refusal_msg);
-  int t = ++g_tmp;
-  volatile int save = g_idset_busy;
-  jmp_buf outer;
-  memcpy(outer, g_unsup_recover, sizeof outer);
-  if (setjmp(g_unsup_recover) != 0) {
-    g_idset_busy = save;
-    memcpy(g_unsup_recover, outer, sizeof outer);
-    longjmp(g_unsup_recover, 1);
-  }
-  g_idset_busy = id;
-  if (boxed) { buf_printf(b, "({ sp_RbVal _t%d = ", t); emit_boxed(c, id, b); }
-  else { buf_printf(b, "({ __auto_type _t%d = ", t); emit_expr(c, id, b); }
-  g_idset_busy = save;
-  memcpy(g_unsup_recover, outer, sizeof outer);
-  buf_printf(b, "; sp_idset_check(_t%d, \"", t);
-  emit_c_escaped(b, dmsg);
-  buf_printf(b, "\"); _t%d; })", t);
-  return 1;
 }
 
 /* A NoMethodError text that names a Class.new class `ci`: "<head><class>" as a C
@@ -4707,9 +4646,6 @@ void refuse_prepass_at_emit(Compiler *c, int id) {
      refusal stands at its own statement */
   if (nt_int(c->nt, id, "attr_splat", 0)) diagnose_unsupported_call(c, id);
   if (!defer_refusals_at(c, id)) return;
-  /* an identity Set's call the proof refuses (refuse_set_identity_members),
-     whose values are no single one a check could read where it arrives */
-  if (g_idset_marks && nt_int(c->nt, id, "idset_refuse", 0)) unsupported_feature(c, id, g_sid_refusal_msg);
   refuse_from_plan(c, id, CRF_SEND, "refuse-send");
   refuse_from_plan(c, id, CRF_CONST_GET, "refuse-const-get");
   refuse_from_plan(c, id, CRF_BINDING, "refuse-binding");
@@ -4865,6 +4801,22 @@ void emit_const_read_close(Compiler *c, int id, const LocalVar *lv, Buf *b) {
   ce.presence = const_has_flag(lv) ? lv : NULL;
   emit_const_read_close_checked(c, id, ce, b);
 }
+/* An optimized constant test still evaluates its constant before testing
+   the subject. The ordinary read's decision (const_read_raises) distinguishes
+   missing names from resolved aliases, FFI values and library classes, and
+   owns the warning, path message and parent evaluation order. Keep this at
+   the test, not in every constant-read prefix: native constructors and rescue
+   matchers can resolve names that are not first-class constant values. A
+   splatted constant (`when *Missing`) is its operand's read. */
+int emit_undefined_const_test(Compiler *c, int id, TyKind result, Buf *b) {
+  if (nt_kind(c->nt, id) == NK_SplatNode) id = nt_ref(c->nt, id, "expression");
+  if (id < 0 || !const_read_raises(c, id)) return 0;
+  buf_puts(b, "((void)(");
+  emit_expr_for_effect(c, id, b);
+  buf_printf(b, "), %s)", default_value_from_compiler(c, result));
+  return 1;
+}
+
 /* The effects of a statically resolved path, outermost parent first. The
    opening comma expression lets a caller retain the folded value or call. */
 int emit_const_read_prefix(Compiler *c, int id, Buf *b) {
@@ -5078,8 +5030,23 @@ const char *ffi_c_type(const char *spec) {
    header declaration, function-like macro or second module binding the same
    symbol under other specs can conflict with it. */
 void ffi_extern_name(Compiler *c, int fi, Buf *out) {
-  const char *sym = c->ffi_funcs[fi].csym ? c->ffi_funcs[fi].csym : c->ffi_funcs[fi].name;
-  buf_printf(out, "sp_ffi_f%d_%s", fi, sym);
+  const FfiFunc *f = &c->ffi_funcs[fi];
+  const char *sym = f->csym ? f->csym : f->name;
+  if (!f->via_fp) { buf_printf(out, "sp_ffi_f%d_%s", fi, sym); return; }
+  /* through the pointer the package's attach resolved (#11362), cast to the
+     function type the specs declare */
+  int ci = comp_class_index(c, f->mod);
+  const char *rn = ci >= 0 ? class_ruby_name(c, ci) : NULL;
+  buf_printf(out, "((%s (*)(", ffi_c_type(f->ret));
+  for (int ai = 0; ai < f->nargs; ai++) buf_printf(out, "%s%s", ai ? ", " : "", ffi_c_type(f->args[ai]));
+  buf_printf(out, "%s))sp_ffi_fp_live(", f->nargs ? "" : "void");
+  ffi_fp_slot_name(c, fi, out);
+  buf_printf(out, ", \"%s\", \"%s\"))", rn ? rn : f->mod, f->name);
+}
+/* The static pointer a via_fp entry calls through */
+void ffi_fp_slot_name(Compiler *c, int fi, Buf *out) {
+  const FfiFunc *f = &c->ffi_funcs[fi];
+  buf_printf(out, "sp_ffi_fp%d_%s", fi, f->csym ? f->csym : f->name);
 }
 
 /* The C type of one ffi_callback argument, used to build the trampoline's own
@@ -5956,9 +5923,7 @@ void emit_ctype(Compiler *c, TyKind t, Buf *b) {
 /* The element stamp a pointer array is boxed with (#4486): the runtime's one
    cls_id for pointer arrays is type-erased, so the box carries what the
    elements are for the poly paths to read them back. */
-/* The constructor of an empty pointer array of kind t: a String Array of
-   handles is stamped at birth, so what reads it before anything boxes it
-   (inspect) knows what it holds */
+/* The constructor of an empty pointer array of kind t */
 const char *ptr_array_new_c(TyKind t) { return "sp_PtrArray_new()"; }
 const char *ptr_array_stamp(Compiler *c, TyKind t) {
   static char buf[64];
@@ -6063,6 +6028,10 @@ const char *array_kind(TyKind t) {
     case TY_STR_ARRAY:   return "Str";
     default:             return NULL;
   }
+}
+/* Does sp_<k>Array have new_cap(n), an empty array its buffer sized for n? */
+int array_has_new_cap(const char *k) {
+  return k && (sp_streq(k, "Int") || sp_streq(k, "Float") || sp_streq(k, "Ptr") || sp_streq(k, "Poly"));
 }
 /* Storage prefix for a loop over the array itself. A nested numeric table is
    an sp_PtrArray of row pointers, so the walk is sp_PtrArray_length / _get
@@ -6267,8 +6236,14 @@ void fzl_emit_defs(const char *t, Buf *out, int handles) {
     if (k >= 0) used[k] = 1;
     p = q;
   }
+  /* a program that dedups a String (-@, dedup, Symbol#name) hands its
+     literals to the runtime's fstring table (sp_fzl_intern): `-x` of a
+     literal's content answers the literal. One that does not pays nothing. */
+  int dedups = handles && (strstr(t, "sp_str_uminus_val(") || strstr(t, "sp_str_dedup("));
+  int nlit = 0;
   for (int k = 0; k < g_fzl_n; k++) {
     FzlLit *f = &g_fzl[k];
+    if (used[k]) nlit++;
     if (used[k] && handles)
       buf_printf(out, "static sp_StringLiteral _fzl_%s_slot = { NULL, NULL };\n"
                       "static struct { sp_str_hdr h; unsigned char m; char d[%zu]; } _fzl_%s = "
@@ -6282,8 +6257,15 @@ void fzl_emit_defs(const char *t, Buf *out, int handles) {
                  f->raw_len + 1, f->name, f->raw_len + 1,
                  fzl_esc_ascii7(f->esc, f->esc_len) ? " | SP_STR_SIZE_ASCII7" : "",
                  f->raw_len, f->esc);
-    free(f->esc);
   }
+  if (dedups && nlit) {
+    buf_puts(out, "static const char *const sp_fzl_all[] = {");
+    for (int k = 0, i = 0; k < g_fzl_n; k++)
+      if (used[k]) buf_printf(out, "%s_fzl_%s.d", i++ ? ", " : " ", g_fzl[k].name);
+    buf_printf(out, " };\nstatic void __attribute__((constructor)) sp_fzl_all_set(void) "
+                    "{ sp_fzl_lits = sp_fzl_all; sp_fzl_nlits = %d; }\n", nlit);
+  }
+  for (int k = 0; k < g_fzl_n; k++) free(g_fzl[k].esc);
   free(used);
   free(g_fzl); g_fzl = NULL; g_fzl_n = g_fzl_cap = 0;
   free(g_fzl_slot); g_fzl_slot = NULL; g_fzl_slots = 0;
@@ -7568,18 +7550,12 @@ int typed_array_src_held(Compiler *c, int node) {
   return read_is_held(c, node) || nt_kind(c->nt, node) == NK_ArrayNode;
 }
 /* The proc-form clone of scope `s`, or -1. Made in analyze (make_yield_proc_forms):
-   a second scope named "<name>#pf" on the same class, holding an independently
-   typed copy of the body whose yields answer poly. */
+   a second scope on the same class holding an independently typed copy of the
+   body whose yields answer poly, linked from `s` (Scope.pf_clone). */
 int scope_proc_form_of(Compiler *c, int s) {
   if (s < 0 || s >= c->nscopes) return -1;
   Scope *sc = &c->scopes[s];
-  if (!sc->name || !sc->yields) return -1;
-  char pfname[192];
-  snprintf(pfname, sizeof pfname, "%s#pf", sc->name);
-  int pi = sc->class_id < 0 ? comp_method_index(c, pfname)
-         : (sc->is_cmethod ? comp_cmethod_in_class : comp_method_in_class)(c, sc->class_id, pfname);
-  if (pi < 0 || !c->scopes[pi].is_proc_form) return -1;
-  return pi;
+  return sc->yields ? comp_scope_pf_clone(c, sc) : -1;
 }
 /* Is proc form `s` one some call can reach? The poly dispatch that names it
    is emitted after the reachability pass, so the clone's own flag cannot say;
@@ -7595,16 +7571,8 @@ int proc_form_live(Compiler *c, int s) {
 }
 /* The method proc form `s` was cloned from, or -1. */
 int proc_form_source(Compiler *c, int s) {
-  Scope *pf = &c->scopes[s];
-  const char *nm = pf->name;
-  const char *h = nm ? strstr(nm, "#pf") : NULL;
-  if (!pf->is_proc_form || !h) return -1;
-  char src[192];
-  size_t n = (size_t)(h - nm);
-  if (n >= sizeof src) return -1;
-  memcpy(src, nm, n); src[n] = 0;
-  if (pf->class_id < 0) return comp_method_index(c, src);
-  return (pf->is_cmethod ? comp_cmethod_in_class : comp_method_in_class)(c, pf->class_id, src);
+  const Scope *pf = &c->scopes[s];
+  return pf->is_proc_form ? pf->pf_source - 1 : -1;
 }
 /* Is `new` call `id`, which runs yielding initialize `initm`, a step of a
    cycle of constructors (mark_ctor_cycles)? Its own scope, or the method a
@@ -7828,7 +7796,8 @@ int ty_matches_class(Compiler *c, TyKind t, const char *cn, int exact) {
                                      t == TY_COMPLEX || t == TY_RATIONAL)) return 1;
   if (sp_streq(cn, "Numeric") && (t == TY_INT || t == TY_BIGINT || t == TY_FLOAT ||
                                   t == TY_COMPLEX || t == TY_RATIONAL)) return 1;
-  if (sp_streq(cn, "Enumerable") && (ty_is_array(t) || ty_is_hash(t) || t == TY_RANGE || t == TY_TIME_RANGE || t == TY_OBJ_RANGE ||
+  if (sp_streq(cn, "Enumerable") && (ty_is_array(t) || ty_is_hash(t) || t == TY_RANGE || t == TY_FLOAT_RANGE || t == TY_STR_RANGE ||
+                                     t == TY_TIME_RANGE || t == TY_OBJ_RANGE ||
                                      t == TY_ENUMERATOR)) return 1;
   /* a program module the program mixed into this builtin by reopening it */
   if (tmc_prog_module_in_builtin(c, self_cls, cn)) return 1;

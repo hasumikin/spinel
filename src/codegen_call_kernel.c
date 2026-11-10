@@ -558,7 +558,7 @@ int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
       /* the frozen "true" / "false" true.to_s answers; a bare C literal here
          had no marker byte at all */
       else if (at == TY_BOOL) { buf_puts(b, "(("); emit_expr(c, av[0], b); buf_puts(b, ") ? sp_str_frozen_true : sp_str_frozen_false)"); }
-      else if (at == TY_SYMBOL) { buf_puts(b, "sp_sym_to_s_frozen("); emit_expr(c, av[0], b); buf_puts(b, ")"); }
+      else if (at == TY_SYMBOL) { buf_puts(b, "sp_sym_to_s_new("); emit_expr(c, av[0], b); buf_puts(b, ")"); }   /* String(sym) calls to_s: a new String */
       else if (at == TY_NIL || at == TY_UNKNOWN) { buf_puts(b, "sp_poly_to_s(sp_box_nil())"); }
       else if (ty_is_object(at) && emit_kconv_obj_nil(c, av[0], ty_object_class(at), "to_str", NULL, b)) {}
       /* Kernel#String asks for #to_str first, and only then #to_s (#3721) */
@@ -710,6 +710,17 @@ int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
         buf_puts(b, ")");
         return 1;
       }
+    }
+    /* format() with no format string: CRuby's ArgumentError. `Kernel.format`
+       reaches here bare (desugar_kernel_recv), as does the arm a boxed
+       receiver's `x.format` takes for a Kernel value read in the program
+       (desugar_class_value_builtin_cmethod); it was refused, and the refusal
+       took the whole statement with it */
+    if (is_format_alias(name) && ac == 0) {
+      TyKind ft = comp_ntype(c, id);
+      if (ft == TY_UNKNOWN || ft == TY_VOID) ft = TY_STRING;
+      buf_printf(b, "(sp_raise_cls(\"ArgumentError\", \"too few arguments\"), %s)", default_value_from_compiler(c, ft));
+      return 1;
     }
     if ((is_format_alias(name)) && ac >= 1) {
       /* format(fmt, *args) -> sp_str_format_polyarr(fmt, poly_arr) */

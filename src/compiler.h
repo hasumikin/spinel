@@ -28,8 +28,6 @@ extern int g_nrequired_features;
 /* a feature in it that is not a library the program's start loads (a core
    library CRuby has loaded before it starts): a require the program makes */
 int sp_requires_non_boot_feature(void);
-/* SPINEL_SHARE_STRINGS is on: set, not empty and not "0" (spinel_parse.c) */
-int sp_share_strings_env(void);
 void sp_feature_mark(const char *name);
 int sp_feature_enabled(const char *name);
 int        sp_feature_required(const char *name); /* require was actually written (gate-independent) */
@@ -170,8 +168,7 @@ typedef struct {
   int cell_outlives; /* the cell was made for a proc that can OUTLIVE the call
                        (a proc/lambda, a Fiber/Thread body, a handler, a block
                        forwarded into a poly callee). A cell only lifted
-                       iteration blocks made is consumed while the call runs,
-                       so a byref parameter may still lend its slot (#4568). */
+                       iteration blocks made is consumed while the call runs. */
   int proc_rebinds; /* a proc or block that captures it assigns the cell:
                        any later call may run it and rebind the local, so a
                        read ahead of one is taken first (read_rebound_by) */
@@ -180,14 +177,6 @@ typedef struct {
                        C slot. Keep that slot alongside the cell and copy it in
                        at the top of the body, so a proc lifted out of the block
                        reads this iteration's value through the cell. */
-  int byref_out;    /* (params) a string param the method body mutates in place
-                       (`<<`/bang mutators): passed as const char** so the
-                       mutation lands in the caller's variable, like CRuby's
-                       shared-object semantics. Implies is_cell (body reads and
-                       writes go through *_cell_<name>), but the cell is the
-                       caller's slot -- no heap cell is allocated on entry. */
-  int borrowed_volatile; /* codegen: this String slot, or a slot borrowed here,
-                           is live across setjmp; propagate through lending */
   int inline_alias; /* (params of a yielding method, codegen only) how many
                        inline expansions currently in progress bind this
                        parameter as an ALIAS of the caller's variable rather
@@ -198,6 +187,9 @@ typedef struct {
                        a copy that goes stale on the first reallocation. */
   int init_guarded; /* (consts) initialized via `CONST = Class.new(...)`: reads
                        during the init raise NameError (uninitialized constant) */
+  int nil_default_boxed; /* (params) a Time, Complex, Rational or Tms
+                       parameter boxed for its `= nil` default: it holds no
+                       Integer, so a Range of it stays boxed in promote mode */
   int rbs_seeded;   /* param type pinned from an --rbs advisory seed: the
                        fixpoint must not widen it (see apply_rbs_seeds) */
   int rbs_box_held; /* (params) a box reached the container seed while the
@@ -350,10 +342,6 @@ typedef struct {
                        modifier `if`, one branch, a loop body), so the read
                        answers nil, and the slot starts nil as an
                        or-written one does */
-  int elems_shared; /* --share-strings: a String container whose elements
-                       the rule shares settled in its poly form, and its
-                       elements are boxed handles (repr_of_slot's
-                       elems_handle) */
   int str_shared;   /* (TY_STRBUF) a shared-mutable string: it is aliased
                        (`s2 = s1`) AND mutated in place, so the whole alias set
                        holds the one sp_String* handle -- reads hand out the live
@@ -371,16 +359,10 @@ typedef struct {
                        place, by the method itself or by a method it hands
                        the parameter to (its read lifted into the handle,
                        poly_strbuf_lift), so its callers hand over the handle
-                       (convert_byref_handle_params). POLY_LIFT_ZSUPER: a
+                       (pull_args_into_handle_params). POLY_LIFT_ZSUPER: a
                        bare `super` hands it to such a parameter and it can
                        hold a String, so the super lifts it as a marked read
                        is (emit_zsuper_arg). (#6179) */
-  int str_append;   /* (TY_STRBUF) an append accumulator: appended to inside a
-                       loop and never read inside one, so the growable handle
-                       makes each `<<` amortized O(1) instead of copying the
-                       whole accumulation. Durable, like str_shared: the type
-                       is re-asserted after the fixpoint, which a later
-                       assign-based pass would otherwise overwrite. */
   int poly_hash_pin; /* an empty-`{}` local handed to a TY_POLY parameter: the
                        callee writes through the reference with the boxed
                        accessors, which only persist to a PolyPoly hash, so the
@@ -508,16 +490,32 @@ typedef struct {
      (alias_accessor_method): 1 + the node of the attr_* call that declares
      it, 0 for none */
   int accessor_of;
-  /* the copy of an ancestor's def an alias is (register_alias_methods): 1 +
-     the scope that def's method is in the alias's class's ancestry (the
-     owner's own, a mixin's copy or a prepend's), whose super the copy's is
+  /* the copy of a def an alias is (register_alias_methods: an ancestor
+     class's def, or an initialize, the class's own too): 1 + the scope
+     that def's method is in the alias's class's ancestry (the owner's own,
+     a mixin's copy or a prepend's), whose super the copy's is
      (cplan_super_target); 0 for none */
   int super_of;
-  /* the copy of an ancestor's method an alias is (register_alias_methods): a
-     method of its class, not an inherited copy, and the name of the method
-     it is the copy of (Method#original_name of a define_method's, which no
-     def names) */
+  /* a yielding method's proc-form clone (make_yield_proc_forms) and the
+     method it was cloned from, each 1 + the other's scope; 0 for none. The
+     clone is no method of the program's table, so the two know each other
+     by index, not by the spelling of the clone's name. Only the def that
+     was cloned holds pf_clone; pf_by_name marks a yielding def that lost
+     its name to a later one in its class (comp_scope_pf_clone) */
+  int pf_clone;
+  int pf_source;
+  int pf_by_name;
+  /* the copy of a method an alias is (register_alias_methods: an
+     ancestor's, or an initialize, the class's own too): a method of its
+     class, not an inherited copy, and the name of the method it is the
+     copy of (Method#original_name of a define_method's, which no def
+     names) */
   char *alias_of;
+  /* an initialize a super in a copy of an initialize reaches
+     (register_alias_methods): compiled with its value, not void
+     (method_is_void). It is set whether or not the super's value is read,
+     a superset that costs only a returned value nothing reads */
+  unsigned char init_value;
   enum { ENTRY_NONE, ENTRY_DISPATCH, ENTRY_TABLE, ENTRY_NAMED } entry;
   int version_n, main_n;
   unsigned char cand_bound; /* a call on a poly receiver bound its arguments
@@ -525,6 +523,7 @@ typedef struct {
                                (analyze_pass.c): what its parameters hold is
                                what that call hands, should it reach this one */
   int is_cmethod;   /* `def self.foo`: a class (singleton) method, no instance self */
+  unsigned char params_later;   /* a `...` def's: its parameters wait for the forwarding lowering (scope_forwarding_params) */
   int is_module_function; /* `module_function`: ALSO a private instance method of
                              every includer. The body cannot depend on the
                              receiver (its self differs per call form), so the
@@ -643,6 +642,7 @@ typedef struct {
   char **pnames;    /* parameter names, in order (requireds then optionals) */
   int *pdefault;    /* per-param default-value node id, or -1 if required */
   int nparams;
+  int pcap;         /* allocated length of pnames and pdefault (scope_reserve_param grows it) */
   int nrequired;    /* index past the LAST required param, not a count:
                        scope_add_param sets it to nparams on every required
                        one, so `def f(x = 1, y)` reports 2. Kept as-is because
@@ -688,16 +688,18 @@ typedef struct {
   int is_ext_entry;    /* designated --ext-entry: emitted non-static, a DCE
                           root, declared in the emitted extension header (#M1
                           of docs/internals/ext-design.md) */
+  int is_ext_method;   /* an instance method of an --ext-class class: a DCE
+                          root, called by name through the method table the
+                          library exports (ext_emit_method_tables) */
   int ret_rbs_seeded;  /* ret pinned from an --rbs advisory seed: the fixpoint
                           must not recompute it from the body */
   int ret_rbs_box_held; /* a box reached that container seed while the
                           fixpoint ran and the seed held: the settled types
                           decide (ret_seed_holds, an_settle_seed_boxes) */
-  int ret_elems_shared; /* --share-strings: that seed was Array[String], and the
+  int ret_elems_shared; /* that seed was Array[String], and the
                           Strings the method answers are shared, so the return
                           settled in its poly form, the boxes holding the
-                          handles (share_default_apply), as a local's does
-                          (LocalVar.elems_shared); the same Ruby type in its
+                          handles (share_default_apply); the same Ruby type in its
                           shared C form, not a contradiction of the seed (#9626) */
   int ret_pub_fresh;   /* --share-strings: a deep-return pickup takes this
                           method's value, and a tail of it answers a fresh
@@ -851,9 +853,8 @@ typedef struct {
   unsigned char *ivar_str_shared; /* (#3227) the slot is a shared-mutable
                                      string handle (sp_String *): survives
                                      re-clears; post-fixpoint reasserts it */
-  unsigned char *ivar_elems_shared; /* --share-strings: the TY_POLY_ARRAY slot
-                                       holds its Strings as handles, as a
-                                       LocalVar's elems_shared */
+  unsigned char *ivar_elems_shared; /* the TY_POLY_ARRAY slot
+                                       holds its Strings as handles */
   unsigned char *ivar_nullable_int; /* the slot holds a nilable scalar: some
                                      write to it can leave nil (its nil byte),
                                      so a read of it (or of its attr_reader)
@@ -933,9 +934,6 @@ typedef struct {
                                        ivar_nullable_int for an ivar */
   unsigned char *cvar_str_shared;   /* --share-strings: the TY_STRBUF slot is
                                        the shared handle, as ivar_str_shared */
-  unsigned char *cvar_elems_shared; /* --share-strings: the TY_POLY_ARRAY slot
-                                       holds its Strings as handles, as a
-                                       LocalVar's elems_shared */
   int ncvars, ccvars;
   char **readers;      /* attr reader method names (no '@') */
   int nreaders, creaders;
@@ -1170,7 +1168,7 @@ typedef struct {
   int ncs, ccs;
 } ClassInfo;
 
-/* The bits of ClassInfo.ivar_elems_shared and cvar_elems_shared */
+/* The bits of ClassInfo.ivar_elems_shared */
 enum {
   ELEMS_POLY = 1      /* the TY_POLY_ARRAY slot holds its Strings as handles */
 };
@@ -1198,6 +1196,9 @@ typedef struct {
                       (sp_native_enter/leave): a collection does not wait for it.
                       An ffi_callback from inside it comes back in for the method
                       (sp_native_callback_enter/leave) */
+  int via_fp;      /* a literal attach_function of the bundled ffi package: the
+                      callee is the function pointer the attach resolves at run
+                      time (FFI::Native.note_fp), not an extern (#11362) */
 } FfiFunc;
 
 typedef struct { char *mod; char *name; int val; } FfiConst;     /* ffi_const */
@@ -1379,11 +1380,6 @@ typedef struct {
                        set of user classes its value can hold (analyze_cls.c,
                        #8530); 0 is every class. Read through cls_fact_node. */
   ClsSet *cls_pool; int ncls_pool, cls_fact_n;
-  unsigned char *cls_kind; /* [cls_fact_n] per node, in a program that calls
-                       compare_by_identity: the CK_* kinds its value, and
-                       (shifted by CK_CONTENTS) the elements of the
-                       containers it holds, can be (cls_fact_kinds) */
-  int cls_kind_n;
   int range_unheld; /* while the arguments of a call on a receiver of no known
                        class bind to every method of the name: a Range among
                        them makes no parameter range_held (slot_set) */
@@ -1698,10 +1694,9 @@ typedef struct {
      (itself, for one of those), or -1 at the top level (comp_node_pbases) */
   int *node_pbase; int node_pbase_n;
   char **pbase_keys; int *pbase_key_cnt; int pbase_key_slots, pbase_key_n;   /* key -> times seen */
-  /* --share-strings (SPINEL_SHARE_STRINGS): every String slot is the
-     shared handle (#6765); the share classes (share.h) are rebuilt as the
+  /* every String slot is the shared handle (#6765, --share-strings is
+     still accepted); the share classes (share.h) are rebuilt as the
      analysis goes for the questions still asked of them. */
-  int share_borrows;    /* arguments share_mark_borrows lets borrow the bytes */
   /* the program's parent map, for the emitter's questions about where a node
      sits (codegen_util.c's codegen_parents); rebuilt when the node table
      changed, freed with the Compiler */
@@ -1725,7 +1720,6 @@ typedef struct {
      answers for it, + 2 (1: none; 0: not asked yet) */
   int *lazy_hoist;
   int lazy_hoist_n;
-  int share_strings;
   int has_cm_builtin_alias;   /* a singleton alias captured a builtin's class method (alias_builtin 2) */
   /* the scope + 1 whose block a yield under emit_proc_yield hands its
      arguments to (a proc form, or a method with a `&blk` it calls), or 0 */
@@ -1768,13 +1762,6 @@ typedef struct {
   unsigned bsl_cur;
   struct HandleArgTab *share_args; /* final callers, while sealing share facts */
   struct SbArgIndex *sb_args; /* settled parameter sources, built once for storage */
-  unsigned share_sig;   /* the types the facts were last applied over */
-  unsigned share_in_sig;   /* the types the last application started from */
-  /* the methods compute_byref_out_params let take a lent slot
-     (an_byref_eligible_scopes), kept for the share facts built after it
-     (nbyref_elig scopes; NULL before it runs) */
-  char *byref_elig;
-  int nbyref_elig;
   /* the names the program's global writes assign, as of the node table it
      was made for (analyze_infer.c, gvar_has_write; NULL before the first ask) */
   struct GvarWrites *gvar_writes;
@@ -2247,6 +2234,8 @@ int        class_body_self_ci(Compiler *c, int node);   /* the class a class bod
 int        record_recv_class(Compiler *c, int node);
 int        const_class_value_only(Compiler *c, int node); /* constant slot that may hold a class known only at run time */
 int        class_recv_user_cmethod(Compiler *c, int call, int node, const char *name); /* call's user class method of the name on it */
+int        class_name_reader_argc_raises(Compiler *c, const char *nm, int argc, const int *argv); /* the builtin reader's arity raise applies */
+int        prog_owns_class_name_reader(Compiler *c, const char *nm); /* a Module/Class reopen or an Object class method answers name/to_s/inspect */
 int        dynamic_new_may_reach(Compiler *c, int call_id, int cid);  /* k.new can build cid */
 int        anon_struct_ci_for_value(Compiler *c, int val);  /* k = Struct.new(...) value node */
 const char *struct_call_dup_member(Compiler *c, int callnode);  /* first duplicate member sym name, or NULL */
@@ -2329,11 +2318,6 @@ int        comp_cvar_index(ClassInfo *ci, const char *name);  /* class var; -1 i
 int        comp_cvar_intern(ClassInfo *ci, const char *name); /* find or add; returns index */
 int        comp_cvar_owner(const Compiler *c, int cid, const char *name); /* the class whose slot holds @@name */
 int        cvar_name_ok(const char *n);   /* `@@` and an identifier: a reflection call's literal name that is not one raises NameError */
-/* 1 iff method m's param idx is a byref string out-param (LocalVar.byref_out):
-   passed as const char** so callee mutation lands in the caller's variable. */
-int        comp_byref_param(Compiler *c, Scope *m, int idx);
-/* Propagate codegen's setjmp-slot qualifiers through borrowed String calls. */
-void       propagate_borrowed_volatile(Compiler *c);
 /* Find the instance-method scope index for class_id + method name, or -1. */
 int        comp_method_in_class(Compiler *c, int class_id, const char *name);
 int        comp_method_overridden(Compiler *c, int cid, const char *name, int cmeth);
@@ -2366,7 +2350,9 @@ int        comp_scope_moving(void);   /* a scope is moved for an instance_exec b
 int        comp_cmethod_in_class(Compiler *c, int class_id, const char *name);
 /* Find the class (singleton) method scope, walking the superclass chain. */
 int        comp_cmethod_in_chain(Compiler *c, int class_id, const char *name, int *def_class);
+int        comp_class_value_allocate(Compiler *c, int id);   /* `x.class.allocate`: a class value no constant names */
 int        comp_own_allocate(Compiler *c, int ci, int call);   /* a class method allocate of the program's own answers the call */
+int        allocate_super_reaches_class(Compiler *c, int id);   /* a super in an own allocate that reaches Class#allocate */
 int        class_any_cmethod_eqq(Compiler *c, int ci);
 int        class_own_cmethod_eqq(Compiler *c, int ci);
 int        class_eqq_answers_value(Compiler *c);
@@ -2418,9 +2404,9 @@ const int *comp_name_responders(Compiler *c, const char *name, int is_cm, int *n
 int        comp_name_reader_any(Compiler *c, const char *name);
 /* The classes whose own chain hop defines a reader of `name` (the ones
    comp_reader_in_chain answers with def_class the class itself), ascending,
-   *n of them; kept as comp_name_reader_any's answers are. The kinds walk
-   asked it class by class for every argument-less call on a receiver that
-   can be anything, at every solve. */
+   *n of them; kept as comp_name_reader_any's answers are. The class walk
+   asks it for every argument-less call on a receiver that can be anything,
+   at every solve. */
 const int *comp_name_reader_owners(Compiler *c, const char *name, int *n);
 /* does class_id's chain define the method call id names, and does the call reach it? A call
    marked builtin_only (the super of a program's own reflection, rewritten to
@@ -2496,6 +2482,15 @@ int        comp_method_vis(ClassInfo *ci, const char *name);
    class with an explicit entry wins (a subclass may re-`public` an inherited
    private method), defaulting to SP_VIS_PUBLIC when none records it. */
 int        comp_method_vis_in_chain(Compiler *c, int class_id, const char *name);
+/* --ext-class (analyze_util.c): whether class_id is one the list names
+   (or the list is `all`) and has instances a host can hold, and whether
+   scope si is a public instance method its chain answers that a host can
+   call by name through the exported method table (fixed positional
+   parameters whose types and whose result cross the boundary). */
+int        ext_class_exported(Compiler *c, int class_id);
+int        ext_method_exported(Compiler *c, int class_id, int si, int typed);
+int        ext_scope_host_callable(Compiler *c, int si);
+int        ext_ty_crosses(TyKind t);
 int        comp_method_vis_declared(Compiler *c, int class_id, const char *name, int *at);
 /* Detect an instance_eval/exec trampoline (def m(args,&b); instance_eval/exec(args,&b); end).
    Returns 1 (eval) / 2 (exec) / 0; sets *def_class to the defining class. */
@@ -2533,20 +2528,6 @@ void cls_fact_same(Compiler *c, int node, int as);
 /* Does node's fact say nothing of its classes: every class, or the closed
    world's value from anywhere (every class, Class object and builtin)? */
 int cls_fact_unbounded(Compiler *c, int node);
-/* What else than an object of a class of the program's node's value can be,
-   as the same walk follows it (analyze_cls.c), in a program that calls
-   compare_by_identity: CK_UNSAFE a value whose identity is not CRuby's here
-   or one the walk cannot name (a number, a Range, a builtin's answer, a
-   value from code it does not see), CK_LIT a String literal (one object
-   per text here), CK_STR a String made afresh (an interpolation, a dup, a
-   unary plus, String.new). A Symbol, nil, true, false, a container literal
-   or a Proc adds nothing. cls_fact_kinds answers for the value,
-   cls_fact_contents_kinds for the elements of the containers it holds;
-   CK_UNSAFE for a node the walk has no answer for. */
-enum { CK_UNSAFE = 1, CK_LIT = 2, CK_STR = 4, CK_CONTENTS = 3 };
-void an_cls_kinds(Compiler *c);   /* the walk, once: before the first ask */
-int cls_fact_kinds(Compiler *c, int node);
-int cls_fact_contents_kinds(Compiler *c, int node);
 
 typedef struct { int cls; int mi; int rdcls; int native; } PolyCand;
 const PolyCand *comp_poly_candidates(Compiler *c, const char *name, int *n);
@@ -2636,8 +2617,9 @@ int scope_is_initialize(const Scope *s);   /* is s compiled as a void initialize
 int comp_scope_copied_away(Compiler *c, int s);
 int comp_scope_may_run(Compiler *c, int s);
 int comp_name_is_shadow_copy(Compiler *c, const char *name, int kind);
-const char *comp_super_name(Compiler *c, int parent, const char *name, int is_cmethod);
+const char *comp_super_name(Compiler *c, int parent, const Scope *s);
 const char *comp_scope_def_name(Compiler *c, const Scope *s);
+int comp_scope_pf_clone(Compiler *c, const Scope *s);   /* the proc-form clone s runs, or -1 */
 int comp_super_is_class_new(Compiler *c, int id);
 int comp_super_class_new_boxed(Compiler *c, int id);
 int comp_new_receiver(Compiler *c, int k);

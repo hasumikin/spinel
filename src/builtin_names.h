@@ -449,6 +449,7 @@ int is_object_base_name(const char *n); /* BasicObject Object */
   X(METHOD, "Method", 0, BC_CLASS) \
   X(NOMEMORYERROR, "NoMemoryError", 0, BC_EXCEPTION) \
   X(OBJECTSPACE, "ObjectSpace", 0, BC_CLASS | BC_MODULE | BC_SG_BOOT) \
+  X(OPENSTRUCT, "OpenStruct", 0, BC_CLASS | BC_OSTRUCT) \
   X(PROCESS, "Process", 0, BC_CLASS | BC_MODULE | BC_SG_BOOT) \
   X(RANDOM, "Random", 0, BC_CLASS) \
   X(STRINGSCANNER_ERROR, "StringScanner::Error", 0, BC_EXCEPTION) \
@@ -507,7 +508,11 @@ int is_string_rebind_mutator(const char *n); /* mutators needing argument-rebind
 int is_string_read_only_method(const char *name);
 int str_mutator_str_args(const char *n, int argc, int *int_ok); /* the arguments a String mutator takes as Strings */
 
-int builtin_module_owns(const char *cls, const char *name); /* included ahead of Object */
+int builtin_answers_ahead_of(const char *cls, const char *m, const char *root); /* an ancestor of cls ahead of root (NULL: any) owns instance method m (CRuby's tables) */
+const char *builtin_ancestor_at(const char *cls, int i);   /* the i-th ancestor (0: cls) in CRuby's lookup order, NULL past the last */
+int builtin_owns_instance_method(const char *cls, const char *m);   /* cls's own instance method m, any visibility (CRuby's tables) */
+const char *builtin_next_class_answering(int *i, const char *m);   /* the next class of the tables, from table *i, that Spinel has as a value and that answers m ahead of Object */
+int builtin_id_below_object_answers(int id, const char *m);   /* the builtin class with run-time id `id` does */
 int builtin_mixin_module_id(const char *n);   /* Comparable Enumerable Kernel Math: its builtin id */
 int is_include_name(const char *n);
 int is_prepend_name(const char *n);
@@ -621,10 +626,10 @@ typedef struct { const char *name; int module; unsigned flags; const char *const
    ancestors', then Class's or Module's instance methods)? A builtin the tables
    do not hold (a builtin class row, a reopened builtin) answers 1, unknown, so
    it never raises; 0 for any other name. With certain, only a method CRuby
-   has with no library required, or with one the program requires, at both
-   its shipped and its newest version: a reader that drops a method_missing
-   or a NoMethodError because of the answer needs it sure, and an unknown
-   builtin is none. */
+   has with no library required, or with one the program requires, at the
+   version CRuby ships: a reader that drops a method_missing or a
+   NoMethodError because of the answer needs it sure, and an unknown builtin
+   is none. */
 int builtin_method_answers(const char *cls, const char *name, int sg, int certain);
 /* Does a builtin answer `name` on a self of the kind: main (Kernel's,
    Object's and main's own methods), a module (also Module's) or a class
@@ -649,24 +654,13 @@ int is_check_funcall_name(const char *n);   /* respond_to? respond_to_missing? m
 int is_implicitly_private_name(const char *n); /* initialize initialize_copy/_clone/_dup respond_to_missing? */
 int is_alias_method_name(const char *n);  /* alias_method */
 int is_class_declaration_call(const char *n);  /* visibility, attr_*, include/extend/prepend, alias_method, undef/remove_method */
-/* The operations a String Array (whose elements are handles) answers
-   itself, by name, argument count and block (0 none, 1 a literal block, 2
-   a block argument). */
+/* The operations on a String Array (whose elements are handles) that answer
+   an element's handle, by name, argument count and block (0 none, 1 a
+   literal block, 2 a block argument). */
 typedef enum {
   STRH_NONE,
   STRH_ELEM,     /* [](i), at(i), first, last: the element, a String */
-  STRH_STORE,    /* []=(i, v): stores v's String */
-  STRH_PUSH,     /* <<, push, append: stores each argument's String */
-  STRH_TAKE,     /* pop, shift: removes and answers the element */
-  STRH_LEN,      /* size, length */
-  STRH_EMPTY,    /* empty? */
-  STRH_EACH,     /* each { }: the receiver */
-  STRH_DUP,      /* dup: a new Array of the same Strings */
-  STRH_SELF,     /* to_a: the receiver */
-  STRH_JOIN,     /* join, join(sep) */
-  STRH_INCLUDE,  /* include?(v) */
-  STRH_EQ,       /* ==(other) */
-  STRH_INSPECT   /* inspect, to_s */
+  STRH_TAKE      /* pop, shift: removes and answers the element */
 } StrhOp;
 int strh_op(const char *n, int argc, int block);
 /* the receiver kind a block-taking iterator name belongs to */
@@ -773,8 +767,9 @@ int boot_package_rank_of_path(const char *path, size_t len);   /* the same for s
    cls_id (0 when codegen has none). BC_PLAIN marks Object, BasicObject and
    Data, below which a program's class is an object of its own; BC_SG_BOOT
    a module CRuby 4.0 boots with its singleton class made (its module
-   functions'), as Comparable and Enumerable are not. */
-enum { BC_CLASS = 1, BC_MODULE = 2, BC_EXCEPTION = 4, BC_SOCKET = 8, BC_PLAIN = 16, BC_SG_BOOT = 32 };
+   functions'), as Comparable and Enumerable are not; BC_OSTRUCT
+   OpenStruct, a constant only after `require "ostruct"` (builtin_row). */
+enum { BC_CLASS = 1, BC_MODULE = 2, BC_EXCEPTION = 4, BC_SOCKET = 8, BC_PLAIN = 16, BC_SG_BOOT = 32, BC_OSTRUCT = 64 };
 typedef struct { const char *name; int id; unsigned flags; } BuiltinClass;
 const BuiltinClass *builtin_class_at(int i);   /* the i-th row, NULL past the last */
 int is_native_class_name(const char *n);       /* any row: a class Spinel has without a library */
@@ -819,4 +814,8 @@ int is_port_gvar_name(const char *n);      /* $stdout $stderr $>: assigning an o
    calls nothing), so it answers for each, to_a and deconstruct. */
 int synth_stands_for(const char *name, int i, const char **proto);
 int is_method_list_call(const char *n);    /* attr attr_reader attr_writer attr_accessor remove_method undef_method: every argument names a method */
+/* The builtin classes whose `allocate` raises TypeError "allocator undefined for K" in CRuby: the predicate, and the i-th name (NULL past the end) for a
+   caller that emits one compare each. */
+int is_allocator_undefined_class(const char *n);
+const char *allocator_undefined_class_at(int i);
 #endif
